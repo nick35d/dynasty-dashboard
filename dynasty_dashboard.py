@@ -8,6 +8,17 @@ SLEEPER_BASE = "https://api.sleeper.app/v1"
 
 
 # -----------------------------
+# Helpers
+# -----------------------------
+def ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+# -----------------------------
 # Sleeper API helpers
 # -----------------------------
 @lru_cache(maxsize=None)
@@ -79,12 +90,10 @@ def get_all_league_ids(base_league_id: str) -> list:
         league_ids.append(current_id)
 
         prev = league.get("previous_league_id")
-
-        # Sleeper uses 0 / "0" / None / "" to mean "no previous league"
         if prev in [None, "0", 0, ""]:
             break
 
-        current_id = prev
+        current_id = str(prev)
 
     return league_ids
 
@@ -109,7 +118,6 @@ def compute_head_to_head(league_ids: list) -> pd.DataFrame:
     for league_id in league_ids:
         league = get_league(league_id)
         season = league.get("season")
-        rosters = get_league_rosters(league_id)
         roster_id_to_name = build_roster_user_map(league_id)
 
         for week in range(1, 19):
@@ -134,8 +142,6 @@ def compute_head_to_head(league_ids: list) -> pd.DataFrame:
                 records.append(
                     {
                         "season": season,
-                        "winner_roster_id": winner,
-                        "loser_roster_id": loser,
                         "winner_name": roster_id_to_name.get(winner, f"Roster {winner}"),
                         "loser_name": roster_id_to_name.get(loser, f"Roster {loser}"),
                     }
@@ -158,11 +164,41 @@ def compute_head_to_head(league_ids: list) -> pd.DataFrame:
 
 def render_head_to_head(league_ids: list):
     st.header("Head-to-Head Matrix (All-Time)")
-    matrix = compute_head_to_head(league_ids)
-    if matrix.empty:
+    win_matrix = compute_head_to_head(league_ids)
+    if win_matrix.empty:
         st.info("No head-to-head data found.")
         return
-    st.dataframe(matrix.style.format("{:d}"))
+
+    teams = win_matrix.index.tolist()
+    loss_matrix = win_matrix.T
+
+    display = pd.DataFrame(index=teams, columns=teams, dtype=object)
+    for r in teams:
+        for c in teams:
+            if r == c:
+                display.loc[r, c] = "—"
+            else:
+                w = int(win_matrix.loc[r, c])
+                l = int(loss_matrix.loc[r, c])
+                display.loc[r, c] = f"{w}-{l}"
+
+    style_df = pd.DataFrame("", index=teams, columns=teams, dtype=object)
+    for r in teams:
+        for c in teams:
+            if r == c:
+                style_df.loc[r, c] = "color: gray"
+            else:
+                w = win_matrix.loc[r, c]
+                l = loss_matrix.loc[r, c]
+                if w > l:
+                    style_df.loc[r, c] = "color: green"
+                elif w < l:
+                    style_df.loc[r, c] = "color: red"
+                else:
+                    style_df.loc[r, c] = "color: gray"
+
+    styled = display.style.apply(lambda _: style_df, axis=None)
+    st.dataframe(styled, use_container_width=True)
 
 
 # -----------------------------
@@ -191,14 +227,18 @@ def compute_rivalries(league_ids: list) -> pd.DataFrame:
                 name_a = roster_name_map.get(ra, f"Roster {ra}")
                 name_b = roster_name_map.get(rb, f"Roster {rb}")
                 pair = tuple(sorted([name_a, name_b]))
-                margin = sa - sb
+                # normalize so team_a is pair[0]
+                if name_a == pair[0]:
+                    pa, pb = sa, sb
+                else:
+                    pa, pb = sb, sa
                 records.append(
                     {
                         "season": season,
                         "team_a": pair[0],
                         "team_b": pair[1],
-                        "points_a": sa if name_a == pair[0] else sb,
-                        "points_b": sb if name_b == pair[1] else sa,
+                        "points_a": pa,
+                        "points_b": pb,
                     }
                 )
 
@@ -208,6 +248,8 @@ def compute_rivalries(league_ids: list) -> pd.DataFrame:
     df = pd.DataFrame(records)
     df["games"] = 1
     df["diff"] = df["points_a"] - df["points_b"]
+    df["win_a"] = (df["points_a"] > df["points_b"]).astype(int)
+    df["win_b"] = (df["points_b"] > df["points_a"]).astype(int)
 
     agg = (
         df.groupby(["team_a", "team_b"])
@@ -215,11 +257,31 @@ def compute_rivalries(league_ids: list) -> pd.DataFrame:
             games=("games", "sum"),
             total_diff=("diff", "sum"),
             avg_margin=("diff", "mean"),
+            wins_a=("win_a", "sum"),
+            wins_b=("win_b", "sum"),
         )
         .reset_index()
     )
 
-    agg["rivalry_score"] = agg["games"] * (1 / (1 + agg["total_diff"].abs()))
+    agg["record"] = agg["wins_a"].astype(int).astype(str) + "-" + agg["wins_b"].astype(
+        int
+    ).astype(str)
+
+    # rivalry score: games * closeness * competitiveness
+    agg["closeness_score"] = 1 / (1 + agg["avg_margin"].abs())
+    win_pct_a = agg["wins_a"] / agg["games"]
+    win_pct_b = agg["wins_b"] / agg["games"]
+    agg["competitiveness_score"] = 1 - (win_pct_a - win_pct_b).abs()
+    agg["raw_score"] = (
+        agg["games"] * agg["closeness_score"] * agg["competitiveness_score"]
+    )
+
+    max_raw = agg["raw_score"].max()
+    if max_raw > 0:
+        agg["rivalry_score"] = 100 * agg["raw_score"] / max_raw
+    else:
+        agg["rivalry_score"] = 0
+
     agg = agg.sort_values("rivalry_score", ascending=False)
     return agg
 
@@ -231,11 +293,15 @@ def render_top_rivalries(league_ids: list):
         st.info("No rivalry data found.")
         return
 
+    df = df.copy()
+    df["rivalry_score_display"] = df["rivalry_score"].round(0).astype(int).astype(str)
+    df["rivalry_score_display"] = "⭐ " + df["rivalry_score_display"]
+
     top_n = st.slider("Number of rivalries to show", 5, 50, 10)
     st.subheader("Top Rivalries (Ranked)")
     st.dataframe(
         df.head(top_n)[
-            ["team_a", "team_b", "games", "total_diff", "avg_margin", "rivalry_score"]
+            ["team_a", "team_b", "record", "games", "avg_margin", "rivalry_score_display"]
         ],
         use_container_width=True,
     )
@@ -277,6 +343,13 @@ def compute_playoff_history(league_ids: list):
                 else:
                     winner, loser = rb, ra
                     wp, lp = sb, sa
+
+                is_playoff = bool(a.get("is_playoff") or b.get("is_playoff"))
+                is_consolation = bool(a.get("is_consolation") or b.get("is_consolation"))
+                is_championship = bool(
+                    a.get("is_championship") or b.get("is_championship")
+                )
+
                 records.append(
                     {
                         "season": season,
@@ -289,6 +362,9 @@ def compute_playoff_history(league_ids: list):
                         "loser_name": roster_name_map.get(loser, f"Roster {loser}"),
                         "winner_points": wp,
                         "loser_points": lp,
+                        "is_playoff": is_playoff,
+                        "is_consolation": is_consolation,
+                        "is_championship": is_championship,
                     }
                 )
 
@@ -297,15 +373,31 @@ def compute_playoff_history(league_ids: list):
 
     df = pd.DataFrame(records)
 
-    titles = (
-        df.sort_values(["season", "week"])
-        .groupby("season")
-        .tail(1)[["season", "winner_name"]]
-        .rename(columns={"winner_name": "champion"})
-    )
+    # winners bracket only
+    winners_bracket = df[
+        df["is_playoff"]
+        & (~df["is_consolation"].fillna(False))
+    ]
 
-    wins = df.groupby("winner_name").size().rename("playoff_wins")
-    losses = df.groupby("loser_name").size().rename("playoff_losses")
+    # champions by season
+    champs = []
+    for season, g in winners_bracket.groupby("season"):
+        champ_games = g[g["is_championship"].fillna(False)]
+        if not champ_games.empty:
+            row = champ_games.iloc[0]
+        else:
+            max_week = g["week"].max()
+            gw = g[g["week"] == max_week]
+            # pick highest combined points as fallback
+            gw = gw.copy()
+            gw["total_points"] = gw["winner_points"] + gw["loser_points"]
+            row = gw.sort_values("total_points", ascending=False).iloc[0]
+        champs.append({"season": season, "champion": row["winner_name"]})
+
+    titles = pd.DataFrame(champs)
+
+    wins = winners_bracket.groupby("winner_name").size().rename("playoff_wins")
+    losses = winners_bracket.groupby("loser_name").size().rename("playoff_losses")
     rec = pd.concat([wins, losses], axis=1).fillna(0)
     rec["playoff_games"] = rec["playoff_wins"] + rec["playoff_losses"]
     rec["playoff_win_pct"] = np.where(
@@ -315,7 +407,7 @@ def compute_playoff_history(league_ids: list):
     )
     rec = rec.reset_index().rename(columns={"index": "team"})
 
-    return df, titles, rec
+    return winners_bracket, titles, rec
 
 
 def render_playoff_history(league_ids: list):
@@ -412,26 +504,38 @@ def compute_transaction_profiles(league_ids: list) -> pd.DataFrame:
 
     out = wide.join(adds_drops, how="outer").fillna(0)
 
-    out["trade_aggressiveness"] = out.get("trade_count", 0)
-    out["waiver_aggressiveness"] = out.get("waiver_count", 0) + out.get(
-        "free_agent_count", 0
+    # ensure columns exist
+    for col in ["trade_count", "waiver_count", "free_agent_count"]:
+        if col not in out.columns:
+            out[col] = 0
+
+    out["total_moves"] = (
+        out["trade_count"]
+        + out["waiver_count"]
+        + out["free_agent_count"]
+        + out["adds"]
+        + out["drops"]
     )
-    out["roster_churn"] = out["adds"] + out["drops"]
+
+    # percentiles
+    trade_pct = out["trade_count"].rank(pct=True) * 100
+    waiver_pct = (out["waiver_count"] + out["free_agent_count"]).rank(pct=True) * 100
+    total_pct = out["total_moves"].rank(pct=True) * 100
 
     def classify(row):
-        t = row.get("trade_aggressiveness", 0)
-        w = row.get("waiver_aggressiveness", 0)
-        churn = row.get("roster_churn", 0)
+        t = trade_pct.loc[row.name]
+        w = waiver_pct.loc[row.name]
+        tot = total_pct.loc[row.name]
 
-        if t > 10 and churn > 40:
+        if t >= 90 and w >= 90:
             return "The Chaos Agent"
-        if t > 10:
+        if t >= 80:
             return "The Trader"
-        if churn < 10:
-            return "The Hoarder"
-        if w > 30:
+        if w >= 80:
             return "The Streamer"
-        if t < 5 and churn < 25:
+        if tot <= 20:
+            return "The Hoarder"
+        if tot <= 40:
             return "The Sniper"
         return "Balanced"
 
@@ -455,16 +559,26 @@ def render_transaction_profiles(league_ids: list):
         "adds",
         "drops",
         "faab_spent",
-        "roster_churn",
-        "trade_aggressiveness",
-        "waiver_aggressiveness",
+        "total_moves",
         "archetype",
     ]
     existing_cols = [c for c in cols if c in df.columns]
 
     st.dataframe(
-        df[existing_cols].sort_values("trade_aggressiveness", ascending=False),
+        df[existing_cols].sort_values("trade_count", ascending=False),
         use_container_width=True,
+    )
+
+    st.markdown("### Archetype Glossary")
+    st.markdown(
+        """
+- **The Chaos Agent:** Top 10% in both trades and waiver/free-agent activity. High-volume, unpredictable, reshapes the league landscape weekly.
+- **The Trader:** Top 20% in trade volume. Aggressive dealmaker who constantly reshapes their roster through trades.
+- **The Streamer:** Top 20% in waiver/free-agent moves. Lives on the wire, plays matchups, and churns depth strategically.
+- **The Sniper:** Bottom 40% in total moves but high precision. Makes few moves, but they’re targeted and high-impact.
+- **The Hoarder:** Bottom 20% in total moves. Rarely trades or churns; prefers stability and long-term roster building.
+- **Balanced:** Middle of the distribution. Healthy mix of trades and waivers without extreme tendencies.
+"""
     )
 
 
@@ -472,26 +586,117 @@ def render_transaction_profiles(league_ids: list):
 # Manager Tendencies
 # -----------------------------
 def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
-    h2h_matrix = compute_head_to_head(league_ids)
-    if h2h_matrix.empty:
+    # build per-game records
+    game_records = []
+    for league_id in league_ids:
+        roster_name_map = build_roster_user_map(league_id)
+        for week in range(1, 19):
+            matchups = get_league_matchups(league_id, week)
+            if not matchups:
+                continue
+            df = pd.DataFrame(matchups)
+            if "matchup_id" not in df.columns:
+                continue
+            for _, group in df.groupby("matchup_id"):
+                if len(group) != 2:
+                    continue
+                a, b = group.iloc[0], group.iloc[1]
+                ra, rb = a["roster_id"], b["roster_id"]
+                sa, sb = a.get("points", 0), b.get("points", 0)
+                pa, pb = a.get("projected_points", 0), b.get("projected_points", 0)
+                name_a = roster_name_map.get(ra, f"Roster {ra}")
+                name_b = roster_name_map.get(rb, f"Roster {rb}")
+
+                game_records.append(
+                    {
+                        "team": name_a,
+                        "opponent": name_b,
+                        "points_for": sa,
+                        "points_against": sb,
+                        "proj_for": pa,
+                        "proj_against": pb,
+                    }
+                )
+                game_records.append(
+                    {
+                        "team": name_b,
+                        "opponent": name_a,
+                        "points_for": sb,
+                        "points_against": sa,
+                        "proj_for": pb,
+                        "proj_against": pa,
+                    }
+                )
+
+    if not game_records:
         return pd.DataFrame()
 
-    teams = h2h_matrix.index.tolist()
-    total_wins = h2h_matrix.sum(axis=1)
-    total_losses = h2h_matrix.sum(axis=0)
-    tendencies = pd.DataFrame(
-        {
-            "team": teams,
-            "wins": total_wins.values,
-            "losses": total_losses.values,
-        }
-    )
-    tendencies["games"] = tendencies["wins"] + tendencies["losses"]
-    tendencies["win_pct"] = np.where(
-        tendencies["games"] > 0,
-        tendencies["wins"] / tendencies["games"],
-        np.nan,
-    )
+    games_df = pd.DataFrame(game_records)
+
+    teams = sorted(games_df["team"].unique())
+    rows = []
+    for team in teams:
+        g = games_df[games_df["team"] == team]
+        if g.empty:
+            continue
+        wins = (g["points_for"] > g["points_against"]).sum()
+        losses = (g["points_for"] < g["points_against"]).sum()
+        games = len(g)
+        win_pct = wins / games if games > 0 else np.nan
+
+        margin = g["points_for"] - g["points_against"]
+        blowout_wins = ((g["points_for"] > g["points_against"]) & (margin >= 20)).sum()
+        close_wins = ((g["points_for"] > g["points_against"]) & (margin <= 5)).sum()
+        blowout_losses = (
+            (g["points_for"] < g["points_against"]) & (margin <= -20)
+        ).sum()
+        close_losses = (
+            (g["points_for"] < g["points_against"]) & (margin >= -5)
+        ).sum()
+
+        upset_wins = (
+            (g["points_for"] > g["points_against"])
+            & (g["proj_for"] < g["proj_against"])
+        ).sum()
+        upset_losses = (
+            (g["points_for"] < g["points_against"])
+            & (g["proj_for"] > g["proj_against"])
+        ).sum()
+
+        avg_pf = g["points_for"].mean()
+        avg_pa = g["points_against"].mean()
+        consistency = g["points_for"].std(ddof=0) if games > 1 else 0.0
+
+        total_pf = g["points_for"].sum()
+        total_pa = g["points_against"].sum()
+        if total_pf + total_pa > 0:
+            exp_win_pct = (total_pf ** 2) / (total_pf ** 2 + total_pa ** 2)
+            expected_wins = exp_win_pct * games
+        else:
+            expected_wins = 0.0
+        luck = wins - expected_wins
+
+        rows.append(
+            {
+                "team": team,
+                "wins": wins,
+                "losses": losses,
+                "games": games,
+                "win_pct": win_pct,
+                "blowout_wins": blowout_wins,
+                "close_wins": close_wins,
+                "blowout_losses": blowout_losses,
+                "close_losses": close_losses,
+                "upset_wins": upset_wins,
+                "upset_losses": upset_losses,
+                "avg_pf": avg_pf,
+                "avg_pa": avg_pa,
+                "consistency": consistency,
+                "luck": luck,
+            }
+        )
+
+    tendencies = pd.DataFrame(rows)
 
     tx = compute_transaction_profiles(league_ids)
     if not tx.empty:
@@ -507,8 +712,28 @@ def render_manager_tendencies(league_ids: list):
         st.info("No tendencies data found.")
         return
 
+    display_cols = [
+        "team",
+        "wins",
+        "losses",
+        "games",
+        "win_pct",
+        "blowout_wins",
+        "close_wins",
+        "blowout_losses",
+        "close_losses",
+        "upset_wins",
+        "upset_losses",
+        "avg_pf",
+        "avg_pa",
+        "consistency",
+        "luck",
+        "archetype",
+    ]
+    existing = [c for c in display_cols if c in df.columns]
+
     st.dataframe(
-        df.sort_values("win_pct", ascending=False),
+        df[existing].sort_values("win_pct", ascending=False),
         use_container_width=True,
     )
 
@@ -581,6 +806,7 @@ def compute_first_round_trades(league_ids: list):
 
             sent_by_team = {rid: [] for rid in roster_ids}
 
+            # traded 1sts table
             for dp in draft_picks:
                 if dp.get("round") != 1:
                     continue
@@ -619,6 +845,7 @@ def compute_first_round_trades(league_ids: list):
                     }
                 )
 
+            # sent picks description (all rounds)
             for dp in draft_picks:
                 rnd = dp.get("round")
                 pick_season = dp.get("season")
@@ -628,14 +855,12 @@ def compute_first_round_trades(league_ids: list):
                 slot_name = roster_name_map.get(
                     slot_roster_id, f"Roster {slot_roster_id}"
                 )
-                if rnd == 1:
-                    desc = f"{pick_season} 1st (slot {slot_name})"
-                else:
-                    desc = f"{pick_season} {rnd}th (slot {slot_name})"
+                desc = f"{pick_season} {ordinal(rnd)} (slot {slot_name})"
 
                 if prev_owner in sent_by_team:
                     sent_by_team[prev_owner].append(desc)
 
+            # teams involved text
             if len(consenter_ids) == 2:
                 a, b = consenter_ids
                 name_a = roster_name_map.get(a, f"Roster {a}")
@@ -659,6 +884,7 @@ def compute_first_round_trades(league_ids: list):
                     parts.append(f"Team {nm} sent: {sent}")
                 detailed_breakdown = "\n".join(parts)
 
+            # outcomes for 1st-round picks in this trade
             outcomes = []
             for dp in draft_picks:
                 if dp.get("round") != 1:
@@ -680,9 +906,11 @@ def compute_first_round_trades(league_ids: list):
                     f"{pick_season} 1st (slot {slot_name}) → {player_display}"
                 )
 
-            outcomes_text = (
-                "\n".join(outcomes) if outcomes else "No 1st-round picks in this trade"
-            )
+            if not outcomes:
+                # skip trades with no 1st-round picks in the detail table
+                continue
+
+            outcomes_text = "\n".join(outcomes)
 
             trade_detail_rows.append(
                 {
