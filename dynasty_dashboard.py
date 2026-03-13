@@ -10,7 +10,7 @@ from functools import lru_cache
 st.set_page_config(page_title="Dynasty League Dashboard", layout="wide")
 
 SLEEPER_BASE = "https://api.sleeper.app/v1"
-LEAGUE_ID_CURRENT = "917164805700575232"  # your current league id
+LEAGUE_ID_CURRENT = "1180359904212156416"  # your current league id
 
 
 # -----------------------------
