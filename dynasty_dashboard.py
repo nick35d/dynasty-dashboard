@@ -303,7 +303,7 @@ def render_top_rivalries(league_ids: list):
 
 
 # -----------------------------
-# Playoff History (clean, winners bracket only)
+# Playoff History (winners bracket via seeds)
 # -----------------------------
 def compute_playoff_history(league_ids: list):
     records = []
@@ -318,27 +318,17 @@ def compute_playoff_history(league_ids: list):
         playoff_week_start = settings.get("playoff_week_start")
         playoff_teams = settings.get("playoff_teams")
 
-        if playoff_week_start and playoff_teams:
+        if playoff_week_start:
             playoff_week_start = int(playoff_week_start)
-            playoff_teams = int(playoff_teams)
-            # 6-team: 3 weeks, 4-team: 2 weeks, else fallback 3
-            if playoff_teams == 6:
-                weeks = 3
-            elif playoff_teams == 4:
-                weeks = 2
-            else:
-                weeks = 3
         else:
-            # Fallbacks if Sleeper settings missing
             if season == 2020:
                 playoff_week_start = 14
             else:
                 playoff_week_start = 15
-            weeks = 3
 
-        playoff_weeks = list(range(playoff_week_start, playoff_week_start + weeks))
+        # Use all weeks from playoff start through week 18; seeds will filter winners bracket
+        playoff_weeks = list(range(playoff_week_start, 19))
 
-        # identify playoff rosters by seed (1–6)
         rosters = get_league_rosters(league_id)
         playoff_rosters = set()
         for r in rosters:
@@ -368,7 +358,6 @@ def compute_playoff_history(league_ids: list):
                 a, b = group.iloc[0], group.iloc[1]
                 ra, rb = a["roster_id"], b["roster_id"]
 
-                # only count games where BOTH teams are playoff teams
                 if ra not in playoff_rosters or rb not in playoff_rosters:
                     continue
 
@@ -400,7 +389,6 @@ def compute_playoff_history(league_ids: list):
 
     df = pd.DataFrame(records)
 
-    # champions = winners in last playoff week of each season (highest combined points)
     champs = []
     for season, g in df.groupby("season"):
         last_week = g["week"].max()
@@ -735,10 +723,9 @@ def render_manager_tendencies(league_ids: list):
 
 
 # -----------------------------
-# 1st-Round Pick Trade Explorer (clean mapping)
+# 1st-Round Pick Trade Explorer (clean mapping + full sent assets)
 # -----------------------------
 def compute_first_round_trades(league_ids: list):
-    # map (season, round, draft_slot) -> pick info
     season_roster_name = {}
     for league_id in league_ids:
         league = get_league(league_id)
@@ -819,10 +806,9 @@ def compute_first_round_trades(league_ids: list):
             if not first_round_picks:
                 continue
 
-            # one row per pick
             for dp in first_round_picks:
                 pick_season = dp.get("season")
-                slot_roster_id = dp.get("roster_id")  # original draft slot index
+                slot_roster_id = dp.get("roster_id")
                 prev_owner_id = dp.get("previous_owner_id")
                 new_owner_id = dp.get("owner_id")
 
@@ -870,14 +856,10 @@ def compute_first_round_trades(league_ids: list):
                     }
                 )
 
-            # trade‑level summary
-            sent_picks_by_team = {rid: [] for rid in consenter_ids}
             players_for_trade = []
-
             for dp in first_round_picks:
                 pick_season = dp.get("season")
                 slot_roster_id = dp.get("roster_id")
-                prev_owner_id = dp.get("previous_owner_id")
 
                 season_names = season_roster_name.get(pick_season, roster_name_map)
                 slot_name = season_names.get(
@@ -903,10 +885,6 @@ def compute_first_round_trades(league_ids: list):
                 else:
                     pick_label = "1.??"
 
-                desc = f"{pick_season} 1st ({pick_label}) from {slot_name}"
-                if prev_owner_id in sent_picks_by_team:
-                    sent_picks_by_team[prev_owner_id].append(desc)
-
                 players_for_trade.append(
                     f"{pick_season} 1st ({pick_label}) → {player_name} (slot {slot_name})"
                 )
@@ -914,45 +892,42 @@ def compute_first_round_trades(league_ids: list):
             adds = tx.get("adds") or {}
             drops = tx.get("drops") or {}
 
-            player_moves_by_team = {rid: [] for rid in consenter_ids}
+            sent_assets_by_team = {rid: [] for rid in consenter_ids}
 
-            player_from = {}
-            player_to = {}
+            for dp in draft_picks:
+                pick_season = dp.get("season")
+                rnd = dp.get("round")
+                slot = dp.get("roster_id")
+                prev_owner = dp.get("previous_owner_id")
+
+                season_names = season_roster_name.get(pick_season, roster_name_map)
+                slot_name = season_names.get(slot, f"Roster {slot}")
+
+                label = f"{pick_season} {ordinal(rnd)} (from {slot_name})"
+                if prev_owner in sent_assets_by_team:
+                    sent_assets_by_team[prev_owner].append(label)
+
             for pid, rid in drops.items():
-                player_from[pid] = rid
-            for pid, rid in adds.items():
-                player_to[pid] = rid
-
-            all_pids = set(player_from.keys()).union(player_to.keys())
-            for pid in all_pids:
                 name = player_name_from_id(pid)
-                from_rid = player_from.get(pid)
-                to_rid = player_to.get(pid)
-
-                if from_rid is not None and to_rid is not None and from_rid != to_rid:
-                    from_name = roster_name_map.get(from_rid, f"Roster {from_rid}")
-                    to_name = roster_name_map.get(to_rid, f"Roster {to_rid}")
-                    move_desc = f"{name} (from {from_name} to {to_name})"
-                    if from_rid in player_moves_by_team:
-                        player_moves_by_team[from_rid].append(move_desc)
+                sender = rid
+                if sender in sent_assets_by_team:
+                    sent_assets_by_team[sender].append(name)
 
             teams_involved_names = [
                 roster_name_map.get(rid, f"Roster {rid}") for rid in consenter_ids
             ]
             teams_involved = " ↔ ".join(teams_involved_names)
 
-            picks_exchanged_lines = []
+            sent_lines = []
             for rid in consenter_ids:
                 nm = roster_name_map.get(rid, f"Roster {rid}")
-                sent_list = sent_picks_by_team.get(rid, [])
-                if sent_list:
-                    picks_exchanged_lines.append(
-                        f"{nm} sent: " + ", ".join(sent_list)
-                    )
+                assets = sent_assets_by_team.get(rid, [])
+                if assets:
+                    sent_lines.append(f"{nm} sent: " + ", ".join(assets))
                 else:
-                    picks_exchanged_lines.append(f"{nm} sent: (no 1sts)")
+                    sent_lines.append(f"{nm} sent: (no assets)")
 
-            picks_exchanged_text = "\n".join(picks_exchanged_lines)
+            picks_exchanged_text = "\n".join(sent_lines)
             players_selected_text = "\n".join(players_for_trade)
 
             trade_detail_rows.append(
