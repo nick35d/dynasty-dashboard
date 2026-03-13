@@ -9,8 +9,9 @@ from functools import lru_cache
 
 st.set_page_config(page_title="Dynasty League Dashboard", layout="wide")
 
+# Your correct 2025 league ID
+LEAGUE_ID_CURRENT = "1180359904212156416"
 SLEEPER_BASE = "https://api.sleeper.app/v1"
-LEAGUE_ID_CURRENT = "1180359904212156416"  # your current league id
 
 
 # -----------------------------
@@ -19,7 +20,11 @@ LEAGUE_ID_CURRENT = "1180359904212156416"  # your current league id
 
 @lru_cache(maxsize=None)
 def get_league(league_id: str):
-    return requests.get(f"{SLEEPER_BASE}/league/{league_id}").json()
+    try:
+        data = requests.get(f"{SLEEPER_BASE}/league/{league_id}").json()
+        return data
+    except Exception:
+        return None
 
 
 @lru_cache(maxsize=None)
@@ -62,13 +67,30 @@ def get_league_transactions(league_id: str, week: int):
 # -----------------------------
 
 def walk_league_chain(latest_league_id: str):
+    """
+    SAFE VERSION:
+    - Never crashes if Sleeper returns {} or None
+    - Stops cleanly and reports the issue
+    """
     leagues = []
     current = latest_league_id
+
     while current:
         league = get_league(current)
+
+        # Safety: Sleeper sometimes returns {} which Streamlit caches as None
+        if not isinstance(league, dict) or "league_id" not in league:
+            st.error(f"Failed to load league data for league_id={current}. Sleeper returned invalid data.")
+            break
+
         leagues.append(league)
-        current = league.get("previous_league_id")
-    leagues.reverse()
+
+        prev_id = league.get("previous_league_id")
+        if not prev_id:
+            break
+
+        current = prev_id
+
     return leagues
 
 
@@ -90,13 +112,6 @@ def build_roster_user_maps(league):
 # -----------------------------
 
 def detect_playoff_weeks_for_season(league):
-    """
-    Automatic playoff-week detection with safe fallback:
-    - Try to infer from settings
-    - Fallback to:
-        2020: weeks 14–16
-        >=2021: weeks 15–17
-    """
     season = int(league["season"])
     settings = league.get("settings", {}) or {}
     playoff_week_start = settings.get("playoff_week_start")
@@ -116,7 +131,6 @@ def detect_playoff_weeks_for_season(league):
 
 
 def get_playoff_teams_for_season(league):
-    """Seeds 1–6 are playoff teams."""
     rosters = get_league_rosters(league["league_id"])
     playoff_teams = set()
     for r in rosters:
@@ -127,10 +141,6 @@ def get_playoff_teams_for_season(league):
 
 
 def parse_playoff_games_for_season(league):
-    """
-    Return DataFrame of winners-bracket playoff games only,
-    plus metadata to identify rounds.
-    """
     season = int(league["season"])
     playoff_weeks = detect_playoff_weeks_for_season(league)
     playoff_teams = get_playoff_teams_for_season(league)
@@ -494,10 +504,15 @@ def build_player_lineage(leagues, player_id):
 
 @st.cache_data(show_spinner=False)
 def load_all_leagues():
-    return walk_league_chain(LEAGUE_ID_CURRENT)
+    leagues = walk_league_chain(LEAGUE_ID_CURRENT)
+    return leagues or []
 
 
 leagues = load_all_leagues()
+if not leagues:
+    st.error("No leagues could be loaded. Check league ID or Sleeper availability.")
+    st.stop()
+
 season_options = [int(l["season"]) for l in leagues]
 season_options.sort()
 
@@ -531,7 +546,7 @@ current_league = next(l for l in leagues if int(l["season"]) == selected_season)
 
 
 # -----------------------------
-# Tab: Head-to-Head (simple but correct)
+# Tab: Head-to-Head
 # -----------------------------
 
 if selected_tab == "Head-to-Head":
@@ -644,7 +659,7 @@ elif selected_tab == "Playoff History":
 
 
 # -----------------------------
-# Tab: Team Transaction Profiles (simple placeholder)
+# Tab: Team Transaction Profiles (placeholder)
 # -----------------------------
 
 elif selected_tab == "Team Transaction Profiles":
@@ -654,7 +669,7 @@ elif selected_tab == "Team Transaction Profiles":
 
 
 # -----------------------------
-# Tab: Manager Tendencies (simple placeholder)
+# Tab: Manager Tendencies (placeholder)
 # -----------------------------
 
 elif selected_tab == "Manager Tendencies":
