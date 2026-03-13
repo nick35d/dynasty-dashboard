@@ -303,18 +303,26 @@ def render_top_rivalries(league_ids: list):
 
 
 # -----------------------------
-# Playoff History (6-team, correct weeks, winners bracket only)
+# Playoff History (6-team, standings-based seeding, winners bracket only)
 # -----------------------------
 def compute_playoff_history(league_ids: list):
     records = []
+
+    # Build a mapping from league_id to season for clarity
+    league_season_map = {}
     for league_id in league_ids:
         league = get_league(league_id)
         season_raw = league.get("season")
         if season_raw is None:
             continue
-        season = int(season_raw)
+        league_season_map[league_id] = int(season_raw)
 
-        # Explicit playoff weeks based on your league:
+    for league_id in league_ids:
+        season = league_season_map.get(league_id)
+        if season is None:
+            continue
+
+        # Playoff weeks per your league:
         # 2020: weeks 14–16; 2021+: weeks 15–17
         if season == 2020:
             playoff_weeks = [14, 15, 16]
@@ -322,25 +330,71 @@ def compute_playoff_history(league_ids: list):
             playoff_weeks = [15, 16, 17]
 
         rosters = get_league_rosters(league_id)
-        playoff_rosters = set()
-        for r in rosters:
-            r_settings = r.get("settings") or {}
-            seed = (
-                r_settings.get("seed")
-                or r_settings.get("playoff_seed")
-                or r_settings.get("p_standings")
-                or r_settings.get("rank")
-            )
-            if seed is None:
-                continue
-            try:
-                seed_int = int(seed)
-            except (TypeError, ValueError):
-                continue
-            # 6-team playoff, seeds 1–6
-            if 1 <= seed_int <= 6:
-                playoff_rosters.add(r["roster_id"])
+        if not rosters:
+            continue
 
+        # Build standings and compute seeds ourselves:
+        standings_rows = []
+        for r in rosters:
+            s = r.get("settings") or {}
+            wins = s.get("wins", 0)
+            losses = s.get("losses", 0)
+            fpts = s.get("fpts", 0)
+            fpts_dec = s.get("fpts_decimal", 0)
+            fpts_against = s.get("fpts_against", 0)
+            fpts_against_dec = s.get("fpts_against_decimal", 0)
+
+            try:
+                wins = int(wins)
+            except (TypeError, ValueError):
+                wins = 0
+            try:
+                losses = int(losses)
+            except (TypeError, ValueError):
+                losses = 0
+            try:
+                fpts = float(fpts)
+            except (TypeError, ValueError):
+                fpts = 0.0
+            try:
+                fpts_dec = float(fpts_dec)
+            except (TypeError, ValueError):
+                fpts_dec = 0.0
+            try:
+                fpts_against = float(fpts_against)
+            except (TypeError, ValueError):
+                fpts_against = 0.0
+            try:
+                fpts_against_dec = float(fpts_against_dec)
+            except (TypeError, ValueError):
+                fpts_against_dec = 0.0
+
+            total_pf = fpts + fpts_dec / 100.0
+            total_pa = fpts_against + fpts_against_dec / 100.0
+
+            standings_rows.append(
+                {
+                    "roster_id": r["roster_id"],
+                    "wins": wins,
+                    "losses": losses,
+                    "pf": total_pf,
+                    "pa": total_pa,
+                }
+            )
+
+        if not standings_rows:
+            continue
+
+        standings_df = pd.DataFrame(standings_rows)
+
+        # Sleeper-style tiebreakers: Wins DESC, PF DESC, PA DESC, roster_id ASC
+        standings_df = standings_df.sort_values(
+            by=["wins", "pf", "pa", "roster_id"],
+            ascending=[False, False, False, True],
+        ).reset_index(drop=True)
+
+        # Top 6 = playoff teams
+        playoff_rosters = set(standings_df.head(6)["roster_id"].tolist())
         if not playoff_rosters:
             continue
 
@@ -392,25 +446,20 @@ def compute_playoff_history(league_ids: list):
 
     df = pd.DataFrame(records)
 
-    # Champion logic: team with playoff wins and zero playoff losses
+    # Champion logic: team with playoff wins and zero playoff losses,
+    # with tie-breakers on wins, latest win week, and total playoff points.
     champs = []
     for season, g in df.groupby("season"):
-        # Compute per-team playoff record within this season
         wins = g.groupby("winner_name").size().rename("wins")
         losses = g.groupby("loser_name").size().rename("losses")
         rec = pd.concat([wins, losses], axis=1).fillna(0)
         rec["wins"] = rec["wins"].astype(int)
         rec["losses"] = rec["losses"].astype(int)
 
-        # Candidates: at least one win, zero losses
         candidates = rec[(rec["wins"] > 0) & (rec["losses"] == 0)]
         if candidates.empty:
             continue
 
-        # If multiple, break ties by:
-        # 1) most wins
-        # 2) latest playoff week they won
-        # 3) highest total playoff points
         candidates = candidates.sort_values("wins", ascending=False)
         top_wins = candidates["wins"].max()
         candidates = candidates[candidates["wins"] == top_wins]
@@ -418,7 +467,6 @@ def compute_playoff_history(league_ids: list):
         if len(candidates) == 1:
             champ_name = candidates.index[0]
         else:
-            # Tie-breaker 2: latest win week
             latest_win_week = {}
             total_points = {}
             for team in candidates.index:
@@ -436,7 +484,6 @@ def compute_playoff_history(league_ids: list):
             if len(week_candidates) == 1:
                 champ_name = week_candidates[0]
             else:
-                # Tie-breaker 3: highest total points
                 champ_name = max(week_candidates, key=lambda t: total_points[t])
 
         champs.append({"season": season, "champion": champ_name})
