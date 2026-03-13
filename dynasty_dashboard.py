@@ -342,11 +342,14 @@ def compute_playoff_history(league_ids: list):
                     winner, loser = rb, ra
                     wp, lp = sb, sa
 
-                is_playoff = bool(a.get("is_playoff") or b.get("is_playoff"))
-                is_consolation = bool(a.get("is_consolation") or b.get("is_consolation"))
-                is_championship = bool(
+                flag_is_consolation = bool(a.get("is_consolation") or b.get("is_consolation"))
+                flag_is_championship = bool(
                     a.get("is_championship") or b.get("is_championship")
                 )
+
+                is_playoff = True
+                is_consolation = flag_is_consolation
+                is_championship = flag_is_championship
 
                 records.append(
                     {
@@ -371,10 +374,7 @@ def compute_playoff_history(league_ids: list):
 
     df = pd.DataFrame(records)
 
-    winners_bracket = df[
-        df["is_playoff"]
-        & (~df["is_consolation"].fillna(False))
-    ]
+    winners_bracket = df[~df["is_consolation"].fillna(False)]
 
     champs = []
     for season, g in winners_bracket.groupby("season"):
@@ -754,6 +754,15 @@ def compute_first_round_trades(league_ids: list):
                     "player_name": full_name,
                 }
 
+    players_meta = get_players()
+
+    def player_name_from_id(pid: str) -> str:
+        info = players_meta.get(pid) or {}
+        name = info.get("full_name") or info.get("first_name") or ""
+        if not name:
+            return f"Player {pid}"
+        return name
+
     traded_pick_rows = []
     trade_detail_rows = []
 
@@ -783,7 +792,6 @@ def compute_first_round_trades(league_ids: list):
             if not first_round_picks:
                 continue
 
-            # Table 1: one row per traded 1st
             for dp in first_round_picks:
                 pick_season = dp.get("season")
                 slot_roster_id = dp.get("roster_id")
@@ -825,8 +833,7 @@ def compute_first_round_trades(league_ids: list):
                     }
                 )
 
-            # Table 2: one row per trade
-            sent_by_team = {rid: [] for rid in consenter_ids}
+            sent_picks_by_team = {rid: [] for rid in consenter_ids}
             players_for_trade = []
 
             for dp in first_round_picks:
@@ -850,12 +857,37 @@ def compute_first_round_trades(league_ids: list):
                     pick_label = "1.??"
 
                 desc = f"{pick_season} 1st ({pick_label}) from {slot_name}"
-                if prev_owner_id in sent_by_team:
-                    sent_by_team[prev_owner_id].append(desc)
+                if prev_owner_id in sent_picks_by_team:
+                    sent_picks_by_team[prev_owner_id].append(desc)
 
                 players_for_trade.append(
                     f"{pick_season} 1st ({pick_label}) → {player_name} (slot {slot_name})"
                 )
+
+            adds = tx.get("adds") or {}
+            drops = tx.get("drops") or {}
+
+            player_moves_by_team = {rid: [] for rid in consenter_ids}
+
+            player_from = {}
+            player_to = {}
+            for pid, rid in drops.items():
+                player_from[pid] = rid
+            for pid, rid in adds.items():
+                player_to[pid] = rid
+
+            all_pids = set(player_from.keys()).union(player_to.keys())
+            for pid in all_pids:
+                name = player_name_from_id(pid)
+                from_rid = player_from.get(pid)
+                to_rid = player_to.get(pid)
+
+                if from_rid is not None and to_rid is not None and from_rid != to_rid:
+                    from_name = roster_name_map.get(from_rid, f"Roster {from_rid}")
+                    to_name = roster_name_map.get(to_rid, f"Roster {to_rid}")
+                    move_desc = f"{name} (from {from_name} to {to_name})"
+                    if from_rid in player_moves_by_team:
+                        player_moves_by_team[from_rid].append(move_desc)
 
             teams_involved_names = [
                 roster_name_map.get(rid, f"Roster {rid}") for rid in consenter_ids
@@ -865,13 +897,17 @@ def compute_first_round_trades(league_ids: list):
             picks_exchanged_lines = []
             for rid in consenter_ids:
                 nm = roster_name_map.get(rid, f"Roster {rid}")
-                sent_list = sent_by_team.get(rid, [])
-                if sent_list:
-                    picks_exchanged_lines.append(
-                        f"{nm} sent: " + ", ".join(sent_list)
-                    )
+                sent_picks = sent_picks_by_team.get(rid, [])
+                sent_players = player_moves_by_team.get(rid, [])
+                parts = []
+                if sent_picks:
+                    parts.append("Picks: " + ", ".join(sent_picks))
+                if sent_players:
+                    parts.append("Players: " + ", ".join(sent_players))
+                if parts:
+                    picks_exchanged_lines.append(f"{nm} sent: " + " | ".join(parts))
                 else:
-                    picks_exchanged_lines.append(f"{nm} sent: (no 1sts)")
+                    picks_exchanged_lines.append(f"{nm} sent: (no 1sts or players)")
 
             picks_exchanged_text = "\n".join(picks_exchanged_lines)
             players_selected_text = "\n".join(players_for_trade)
