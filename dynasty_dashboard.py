@@ -81,18 +81,15 @@ def get_players() -> dict:
 # League hierarchy helpers
 # -----------------------------
 def get_all_league_ids(base_league_id: str) -> list:
-    """Follow previous_league_id chain backwards to get all seasons, stopping safely on '0'/None."""
     league_ids = []
     current_id = base_league_id
 
     while True:
         league = get_league(current_id)
         league_ids.append(current_id)
-
         prev = league.get("previous_league_id")
         if prev in [None, "0", 0, ""]:
             break
-
         current_id = str(prev)
 
     return league_ids
@@ -227,7 +224,6 @@ def compute_rivalries(league_ids: list) -> pd.DataFrame:
                 name_a = roster_name_map.get(ra, f"Roster {ra}")
                 name_b = roster_name_map.get(rb, f"Roster {rb}")
                 pair = tuple(sorted([name_a, name_b]))
-                # normalize so team_a is pair[0]
                 if name_a == pair[0]:
                     pa, pb = sa, sb
                 else:
@@ -267,7 +263,6 @@ def compute_rivalries(league_ids: list) -> pd.DataFrame:
         int
     ).astype(str)
 
-    # rivalry score: games * closeness * competitiveness
     agg["closeness_score"] = 1 / (1 + agg["avg_margin"].abs())
     win_pct_a = agg["wins_a"] / agg["games"]
     win_pct_b = agg["wins_b"] / agg["games"]
@@ -318,7 +313,10 @@ def compute_playoff_history(league_ids: list):
         settings = league.get("settings", {})
         playoff_week_start = settings.get("playoff_week_start")
         if not playoff_week_start:
-            continue
+            if season == "2020":
+                playoff_week_start = 14
+            else:
+                playoff_week_start = 15
 
         roster_name_map = build_roster_user_map(league_id)
 
@@ -373,13 +371,11 @@ def compute_playoff_history(league_ids: list):
 
     df = pd.DataFrame(records)
 
-    # winners bracket only
     winners_bracket = df[
         df["is_playoff"]
         & (~df["is_consolation"].fillna(False))
     ]
 
-    # champions by season
     champs = []
     for season, g in winners_bracket.groupby("season"):
         champ_games = g[g["is_championship"].fillna(False)]
@@ -387,9 +383,7 @@ def compute_playoff_history(league_ids: list):
             row = champ_games.iloc[0]
         else:
             max_week = g["week"].max()
-            gw = g[g["week"] == max_week]
-            # pick highest combined points as fallback
-            gw = gw.copy()
+            gw = g[g["week"] == max_week].copy()
             gw["total_points"] = gw["winner_points"] + gw["loser_points"]
             row = gw.sort_values("total_points", ascending=False).iloc[0]
         champs.append({"season": season, "champion": row["winner_name"]})
@@ -504,7 +498,6 @@ def compute_transaction_profiles(league_ids: list) -> pd.DataFrame:
 
     out = wide.join(adds_drops, how="outer").fillna(0)
 
-    # ensure columns exist
     for col in ["trade_count", "waiver_count", "free_agent_count"]:
         if col not in out.columns:
             out[col] = 0
@@ -517,7 +510,6 @@ def compute_transaction_profiles(league_ids: list) -> pd.DataFrame:
         + out["drops"]
     )
 
-    # percentiles
     trade_pct = out["trade_count"].rank(pct=True) * 100
     waiver_pct = (out["waiver_count"] + out["free_agent_count"]).rank(pct=True) * 100
     total_pct = out["total_moves"].rank(pct=True) * 100
@@ -586,7 +578,6 @@ def render_transaction_profiles(league_ids: list):
 # Manager Tendencies
 # -----------------------------
 def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
-    # build per-game records
     game_records = []
     for league_id in league_ids:
         roster_name_map = build_roster_user_map(league_id)
@@ -603,7 +594,6 @@ def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
                 a, b = group.iloc[0], group.iloc[1]
                 ra, rb = a["roster_id"], b["roster_id"]
                 sa, sb = a.get("points", 0), b.get("points", 0)
-                pa, pb = a.get("projected_points", 0), b.get("projected_points", 0)
                 name_a = roster_name_map.get(ra, f"Roster {ra}")
                 name_b = roster_name_map.get(rb, f"Roster {rb}")
 
@@ -613,8 +603,6 @@ def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
                         "opponent": name_b,
                         "points_for": sa,
                         "points_against": sb,
-                        "proj_for": pa,
-                        "proj_against": pb,
                     }
                 )
                 game_records.append(
@@ -623,8 +611,6 @@ def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
                         "opponent": name_a,
                         "points_for": sb,
                         "points_against": sa,
-                        "proj_for": pb,
-                        "proj_against": pa,
                     }
                 )
 
@@ -654,15 +640,6 @@ def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
             (g["points_for"] < g["points_against"]) & (margin >= -5)
         ).sum()
 
-        upset_wins = (
-            (g["points_for"] > g["points_against"])
-            & (g["proj_for"] < g["proj_against"])
-        ).sum()
-        upset_losses = (
-            (g["points_for"] < g["points_against"])
-            & (g["proj_for"] > g["proj_against"])
-        ).sum()
-
         avg_pf = g["points_for"].mean()
         avg_pa = g["points_against"].mean()
         consistency = g["points_for"].std(ddof=0) if games > 1 else 0.0
@@ -687,8 +664,6 @@ def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
                 "close_wins": close_wins,
                 "blowout_losses": blowout_losses,
                 "close_losses": close_losses,
-                "upset_wins": upset_wins,
-                "upset_losses": upset_losses,
                 "avg_pf": avg_pf,
                 "avg_pa": avg_pa,
                 "consistency": consistency,
@@ -722,8 +697,6 @@ def render_manager_tendencies(league_ids: list):
         "close_wins",
         "blowout_losses",
         "close_losses",
-        "upset_wins",
-        "upset_losses",
         "avg_pf",
         "avg_pa",
         "consistency",
@@ -753,7 +726,7 @@ def compute_first_round_trades(league_ids: list):
         season = league.get("season")
         season_roster_name[season] = build_roster_user_map(league_id)
 
-    season_round_roster_to_pick = {}
+    season_round_slot_to_pick = {}
     for league_id in league_ids:
         league = get_league(league_id)
         season = league.get("season")
@@ -767,14 +740,16 @@ def compute_first_round_trades(league_ids: list):
             picks = get_draft_picks(draft_id)
             for p in picks:
                 rnd = p.get("round")
+                if rnd != 1:
+                    continue
                 rid = p.get("roster_id")
                 pick_no = p.get("pick_no")
                 meta = p.get("metadata") or {}
                 first = meta.get("first_name", "")
                 last = meta.get("last_name", "")
-                full_name = f"{first} {last}".strip()
+                full_name = f"{first} {last}".strip() or "Unknown Player"
                 key = (season, rnd, rid)
-                season_round_roster_to_pick[key] = {
+                season_round_slot_to_pick[key] = {
                     "pick_no": pick_no,
                     "player_name": full_name,
                 }
@@ -804,125 +779,114 @@ def compute_first_round_trades(league_ids: list):
             roster_ids = tx.get("roster_ids") or []
             consenter_ids = tx.get("consenter_ids") or roster_ids
 
-            sent_by_team = {rid: [] for rid in roster_ids}
+            first_round_picks = [dp for dp in draft_picks if dp.get("round") == 1]
+            if not first_round_picks:
+                continue
 
-            # traded 1sts table
-            for dp in draft_picks:
-                if dp.get("round") != 1:
-                    continue
+            # Table 1: one row per traded 1st
+            for dp in first_round_picks:
                 pick_season = dp.get("season")
                 slot_roster_id = dp.get("roster_id")
-                original_owner_id = dp.get("previous_owner_id")
+                prev_owner_id = dp.get("previous_owner_id")
                 new_owner_id = dp.get("owner_id")
 
-                original_owner_name = roster_name_map.get(
-                    original_owner_id, f"Roster {original_owner_id}"
-                )
-                new_owner_name = roster_name_map.get(
-                    new_owner_id, f"Roster {new_owner_id}"
-                )
-                original_slot_name = roster_name_map.get(
+                season_names = season_roster_name.get(pick_season, roster_name_map)
+
+                original_slot_name = season_names.get(
                     slot_roster_id, f"Roster {slot_roster_id}"
+                )
+                original_owner_name = season_names.get(
+                    prev_owner_id, f"Roster {prev_owner_id}"
+                )
+                new_owner_name = season_names.get(
+                    new_owner_id, f"Roster {new_owner_id}"
                 )
 
                 key = (pick_season, 1, slot_roster_id)
-                pick_info = season_round_roster_to_pick.get(key, {})
+                pick_info = season_round_slot_to_pick.get(key, {})
                 pick_no = pick_info.get("pick_no")
                 player_name = pick_info.get("player_name", "Unknown Player")
 
                 if pick_no is not None:
-                    player_display = f"{player_name} (1.{pick_no:02d})"
+                    pick_label = f"1.{int(pick_no):02d}"
                 else:
-                    player_display = f"{player_name} (1.??)"
+                    pick_label = "1.??"
+
+                player_display = f"{player_name} ({pick_label})"
 
                 traded_pick_rows.append(
                     {
                         "season": pick_season,
+                        "pick": pick_label,
+                        "original_slot": original_slot_name,
                         "original_owner": original_owner_name,
                         "new_owner": new_owner_name,
-                        "original_slot": original_slot_name,
                         "player_selected": player_display,
                     }
                 )
 
-            # sent picks description (all rounds)
-            for dp in draft_picks:
-                rnd = dp.get("round")
+            # Table 2: one row per trade
+            sent_by_team = {rid: [] for rid in consenter_ids}
+            players_for_trade = []
+
+            for dp in first_round_picks:
                 pick_season = dp.get("season")
                 slot_roster_id = dp.get("roster_id")
-                prev_owner = dp.get("previous_owner_id")
+                prev_owner_id = dp.get("previous_owner_id")
 
-                slot_name = roster_name_map.get(
+                season_names = season_roster_name.get(pick_season, roster_name_map)
+                slot_name = season_names.get(
                     slot_roster_id, f"Roster {slot_roster_id}"
                 )
-                desc = f"{pick_season} {ordinal(rnd)} (slot {slot_name})"
 
-                if prev_owner in sent_by_team:
-                    sent_by_team[prev_owner].append(desc)
-
-            # teams involved text
-            if len(consenter_ids) == 2:
-                a, b = consenter_ids
-                name_a = roster_name_map.get(a, f"Roster {a}")
-                name_b = roster_name_map.get(b, f"Roster {b}")
-                teams_involved = f"{name_a} ↔ {name_b}"
-
-                sent_a = ", ".join(sent_by_team.get(a, [])) or "None"
-                sent_b = ", ".join(sent_by_team.get(b, [])) or "None"
-
-                detailed_breakdown = (
-                    f"Team {name_a} sent: {sent_a}\n"
-                    f"Team {name_b} sent: {sent_b}"
-                )
-            else:
-                names = [roster_name_map.get(r, f"Roster {r}") for r in consenter_ids]
-                teams_involved = " ↔ ".join(names)
-                parts = []
-                for rid in consenter_ids:
-                    nm = roster_name_map.get(rid, f"Roster {rid}")
-                    sent = ", ".join(sent_by_team.get(rid, [])) or "None"
-                    parts.append(f"Team {nm} sent: {sent}")
-                detailed_breakdown = "\n".join(parts)
-
-            # outcomes for 1st-round picks in this trade
-            outcomes = []
-            for dp in draft_picks:
-                if dp.get("round") != 1:
-                    continue
-                pick_season = dp.get("season")
-                slot_roster_id = dp.get("roster_id")
-                slot_name = roster_name_map.get(
-                    slot_roster_id, f"Roster {slot_roster_id}"
-                )
                 key = (pick_season, 1, slot_roster_id)
-                pick_info = season_round_roster_to_pick.get(key, {})
+                pick_info = season_round_slot_to_pick.get(key, {})
                 pick_no = pick_info.get("pick_no")
                 player_name = pick_info.get("player_name", "Unknown Player")
+
                 if pick_no is not None:
-                    player_display = f"{player_name} (1.{pick_no:02d})"
+                    pick_label = f"1.{int(pick_no):02d}"
                 else:
-                    player_display = f"{player_name} (1.??)"
-                outcomes.append(
-                    f"{pick_season} 1st (slot {slot_name}) → {player_display}"
+                    pick_label = "1.??"
+
+                desc = f"{pick_season} 1st ({pick_label}) from {slot_name}"
+                if prev_owner_id in sent_by_team:
+                    sent_by_team[prev_owner_id].append(desc)
+
+                players_for_trade.append(
+                    f"{pick_season} 1st ({pick_label}) → {player_name} (slot {slot_name})"
                 )
 
-            if not outcomes:
-                # skip trades with no 1st-round picks in the detail table
-                continue
+            teams_involved_names = [
+                roster_name_map.get(rid, f"Roster {rid}") for rid in consenter_ids
+            ]
+            teams_involved = " ↔ ".join(teams_involved_names)
 
-            outcomes_text = "\n".join(outcomes)
+            picks_exchanged_lines = []
+            for rid in consenter_ids:
+                nm = roster_name_map.get(rid, f"Roster {rid}")
+                sent_list = sent_by_team.get(rid, [])
+                if sent_list:
+                    picks_exchanged_lines.append(
+                        f"{nm} sent: " + ", ".join(sent_list)
+                    )
+                else:
+                    picks_exchanged_lines.append(f"{nm} sent: (no 1sts)")
+
+            picks_exchanged_text = "\n".join(picks_exchanged_lines)
+            players_selected_text = "\n".join(players_for_trade)
 
             trade_detail_rows.append(
                 {
                     "season": season,
                     "teams_involved": teams_involved,
-                    "detailed_breakdown": detailed_breakdown,
-                    "first_round_outcomes": outcomes_text,
+                    "picks_exchanged": picks_exchanged_text,
+                    "players_selected": players_selected_text,
                 }
             )
 
     traded_picks_df = pd.DataFrame(traded_pick_rows).sort_values(
-        ["season", "original_owner"]
+        ["season", "pick", "original_slot"]
     )
     trade_details_df = pd.DataFrame(trade_detail_rows).sort_values(
         ["season", "teams_involved"]
@@ -943,7 +907,7 @@ def render_first_round_pick_explorer(league_ids: list):
     st.subheader("Traded 1st-Round Picks (One Row per Pick)")
     st.dataframe(
         traded_picks_df[
-            ["season", "original_owner", "new_owner", "original_slot", "player_selected"]
+            ["season", "pick", "original_slot", "original_owner", "new_owner", "player_selected"]
         ],
         use_container_width=True,
     )
@@ -951,7 +915,7 @@ def render_first_round_pick_explorer(league_ids: list):
     st.subheader("Trade Details (One Row per Trade)")
     st.dataframe(
         trade_details_df[
-            ["season", "teams_involved", "detailed_breakdown", "first_round_outcomes"]
+            ["season", "teams_involved", "picks_exchanged", "players_selected"]
         ],
         use_container_width=True,
     )
@@ -966,7 +930,7 @@ def main():
 
     base_league_id = st.text_input(
         "Sleeper League ID (current season)",
-        value="1180359904212156416",  # replace with your current league if needed
+        value="1180359904212156416",
     )
 
     if not base_league_id:
