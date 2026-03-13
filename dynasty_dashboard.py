@@ -1,799 +1,795 @@
-import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import streamlit as st
 from functools import lru_cache
 
-st.set_page_config(page_title="Dynasty Dashboard", layout="wide")
-
-# ---------- CONFIG ----------
-
-LEAGUE_IDS_BY_SEASON = {
-    "2025": "1180359904212156416",
-    "2024": "1048279751829368832",
-    "2023": "917164805700575232",
-    "2022": "784501800425377792",
-    "2021": "650036126123405312",
-    "2020": "543561523148333056",
-}
-
-SEASONS_ORDERED = ["2025", "2024", "2023", "2022", "2021", "2020"]
+SLEEPER_BASE = "https://api.sleeper.app/v1"
 
 
-# ---------- API HELPERS ----------
-
-BASE_URL = "https://api.sleeper.app/v1"
-
-
-def _get(url):
-    r = requests.get(url)
+# -----------------------------
+# Sleeper API helpers
+# -----------------------------
+@lru_cache(maxsize=None)
+def get_league(league_id: str) -> dict:
+    r = requests.get(f"{SLEEPER_BASE}/league/{league_id}")
     r.raise_for_status()
     return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_league(league_id: str):
-    return _get(f"{BASE_URL}/league/{league_id}")
+def get_league_rosters(league_id: str) -> list:
+    r = requests.get(f"{SLEEPER_BASE}/league/{league_id}/rosters")
+    r.raise_for_status()
+    return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_rosters(league_id: str):
-    return _get(f"{BASE_URL}/league/{league_id}/rosters")
+def get_league_users(league_id: str) -> list:
+    r = requests.get(f"{SLEEPER_BASE}/league/{league_id}/users")
+    r.raise_for_status()
+    return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_users(league_id: str):
-    return _get(f"{BASE_URL}/league/{league_id}/users")
+def get_league_matchups(league_id: str, week: int) -> list:
+    r = requests.get(f"{SLEEPER_BASE}/league/{league_id}/matchups/{week}")
+    r.raise_for_status()
+    return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_matchups(league_id: str, week: int):
-    return _get(f"{BASE_URL}/league/{league_id}/matchups/{week}")
+def get_league_transactions(league_id: str, week: int) -> list:
+    r = requests.get(f"{SLEEPER_BASE}/league/{league_id}/transactions/{week}")
+    r.raise_for_status()
+    return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_transactions(league_id: str, week: int):
-    return _get(f"{BASE_URL}/league/{league_id}/transactions/{week}")
+def get_league_drafts(league_id: str) -> list:
+    r = requests.get(f"{SLEEPER_BASE}/league/{league_id}/drafts")
+    r.raise_for_status()
+    return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_drafts(league_id: str):
-    return _get(f"{BASE_URL}/league/{league_id}/drafts")
+def get_draft_picks(draft_id: str) -> list:
+    r = requests.get(f"{SLEEPER_BASE}/draft/{draft_id}/picks")
+    r.raise_for_status()
+    return r.json()
 
 
 @lru_cache(maxsize=None)
-def get_draft_picks(draft_id: str):
-    return _get(f"{BASE_URL}/draft/{draft_id}/picks")
+def get_players() -> dict:
+    # All players; used for transaction player name lookup if needed
+    r = requests.get(f"{SLEEPER_BASE}/players/nfl")
+    r.raise_for_status()
+    return r.json()
 
 
-# ---------- UTILS ----------
+# -----------------------------
+# League hierarchy helpers
+# -----------------------------
+def get_all_league_ids(base_league_id: str) -> list:
+    """Follow previous_league_id chain backwards to get all seasons."""
+    league_ids = []
+    current_id = base_league_id
+    while current_id:
+        league = get_league(current_id)
+        league_ids.append(current_id)
+        current_id = league.get("previous_league_id")
+    return league_ids
 
-def build_user_and_roster_maps(league_id: str):
-    users = get_users(league_id)
-    rosters = get_rosters(league_id)
 
-    user_map = {u["user_id"]: u.get("display_name", u.get("username", "Unknown")) for u in users}
-    roster_to_owner = {r["roster_id"]: r["owner_id"] for r in rosters}
-    owner_to_roster = {v: k for k, v in roster_to_owner.items()}
-
-    roster_name_map = {}
+def build_roster_user_map(league_id: str) -> dict:
+    rosters = get_league_rosters(league_id)
+    users = get_league_users(league_id)
+    user_map = {u["user_id"]: u.get("display_name", f"user_{u['user_id']}") for u in users}
+    roster_map = {}
     for r in rosters:
-        owner_id = r["owner_id"]
+        owner_id = r.get("owner_id")
         name = user_map.get(owner_id, f"Roster {r['roster_id']}")
-        roster_name_map[r["roster_id"]] = name
-
-    return users, rosters, user_map, roster_to_owner, owner_to_roster, roster_name_map
-
-
-def get_all_league_ids():
-    return [LEAGUE_IDS_BY_SEASON[s] for s in SEASONS_ORDERED]
+        roster_map[r["roster_id"]] = name
+    return roster_map
 
 
-def get_all_league_data():
-    leagues = {}
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        leagues[season] = {
-            "league": get_league(league_id),
-            "rosters": get_rosters(league_id),
-            "users": get_users(league_id),
-        }
-    return leagues
+# -----------------------------
+# Head-to-Head
+# -----------------------------
+def compute_head_to_head(league_ids: list) -> pd.DataFrame:
+    records = []
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        rosters = get_league_rosters(league_id)
+        roster_id_to_owner = {r["roster_id"]: r.get("owner_id") for r in rosters}
+        roster_id_to_name = build_roster_user_map(league_id)
 
-
-def get_all_matchups_for_league(league_id: str):
-    league = get_league(league_id)
-    total_weeks = league.get("settings", {}).get("playoff_week_start", 15)
-    matchups_by_week = {}
-    for w in range(1, total_weeks + 1):
-        try:
-            matchups_by_week[w] = get_matchups(league_id, w)
-        except Exception:
-            matchups_by_week[w] = []
-    return matchups_by_week
-
-
-def get_all_transactions_for_league(league_id: str):
-    league = get_league(league_id)
-    total_weeks = league.get("settings", {}).get("playoff_week_start", 15)
-    tx_by_week = {}
-    for w in range(1, total_weeks + 1):
-        try:
-            tx_by_week[w] = get_transactions(league_id, w)
-        except Exception:
-            tx_by_week[w] = []
-    return tx_by_week
-
-
-def get_all_draft_picks_for_league(league_id: str):
-    drafts = get_drafts(league_id)
-    all_picks = []
-    for d in drafts:
-        draft_id = d["draft_id"]
-        picks = get_draft_picks(draft_id)
-        for p in picks:
-            p["league_id"] = league_id
-            all_picks.append(p)
-    return all_picks
-
-
-# ---------- 1ST ROUND PICK TRADE EXPLORER ----------
-
-def compute_first_round_trade_results(transactions, draft_picks, rosters, users):
-    if not transactions:
-        return pd.DataFrame(), pd.DataFrame()
-
-    season_to_league = LEAGUE_IDS_BY_SEASON.copy()
-
-    user_map = {u["user_id"]: u.get("display_name", u.get("username", "Unknown")) for u in users}
-    roster_owner = {r["roster_id"]: r["owner_id"] for r in rosters}
-
-    df_tx = pd.DataFrame(transactions)
-    df_dp = pd.DataFrame(draft_picks) if draft_picks else pd.DataFrame()
-
-    if not df_dp.empty:
-        if "league_id" in df_dp.columns:
-            df_dp["league_id"] = df_dp["league_id"].astype(str)
-        if "round" in df_dp.columns:
-            df_dp["round"] = pd.to_numeric(df_dp["round"], errors="coerce").fillna(0).astype(int)
-
-    results = []
-
-    if df_tx.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    trade_rows = df_tx[df_tx["type"] == "trade"]
-    for _, trade in trade_rows.iterrows():
-        picks = trade.get("draft_picks") or []
-        for pick in picks:
-            if pick.get("round") != 1:
+        # assume 1–18 weeks; harmless if some weeks empty
+        for week in range(1, 19):
+            matchups = get_league_matchups(league_id, week)
+            if not matchups:
                 continue
-
-            season = str(pick.get("season"))
-            pick_roster_id = pick.get("roster_id")
-            prev_rid = pick.get("previous_owner_id")
-            curr_rid = pick.get("owner_id")
-
-            pick_league_id = pick.get("league_id")
-            if not pick_league_id and season in season_to_league:
-                pick_league_id = season_to_league[season]
-
-            original_owner = user_map.get(roster_owner.get(prev_rid), f"Roster {prev_rid}")
-            current_owner = user_map.get(roster_owner.get(curr_rid), f"Roster {curr_rid}")
-
-            player_name = None
-            pick_no = None
-
-            if pick_league_id and not df_dp.empty:
-                mask = (
-                    (df_dp["league_id"].astype(str) == str(pick_league_id)) &
-                    (df_dp["round"] == 1) &
-                    (df_dp["roster_id"] == pick_roster_id)
+            df = pd.DataFrame(matchups)
+            if "matchup_id" not in df.columns:
+                continue
+            for mid, group in df.groupby("matchup_id"):
+                if len(group) != 2:
+                    continue
+                a, b = group.iloc[0], group.iloc[1]
+                ra, rb = a["roster_id"], b["roster_id"]
+                sa, sb = a.get("points", 0), b.get("points", 0)
+                if sa == sb:
+                    continue
+                if sa > sb:
+                    winner, loser = ra, rb
+                else:
+                    winner, loser = rb, ra
+                records.append(
+                    {
+                        "season": season,
+                        "winner_roster_id": winner,
+                        "loser_roster_id": loser,
+                        "winner_name": roster_id_to_name.get(winner, f"Roster {winner}"),
+                        "loser_name": roster_id_to_name.get(loser, f"Roster {loser}"),
+                    }
                 )
-                dp = df_dp[mask]
-                if not dp.empty:
-                    dp_row = dp.iloc[0]
-                    meta = dp_row.get("metadata") or {}
-                    player_name = meta.get("player_name") or meta.get("full_name")
-                    pick_no = dp_row.get("pick_no")
 
-            results.append({
-                "season": season,
-                "original_owner": original_owner,
-                "current_owner": current_owner,
-                "player_selected": player_name,
-                "pick_no": pick_no,
-                "transaction_id": trade.get("transaction_id"),
-                "trade_draft_picks": trade.get("draft_picks"),
-                "pick_league_id": pick_league_id,
-                "pick_roster_id": pick_roster_id,
-            })
+    if not records:
+        return pd.DataFrame()
 
-    df_res = pd.DataFrame(results)
-    if df_res.empty:
-        return df_res, df_res
+    df = pd.DataFrame(records)
+    teams = sorted(set(df["winner_name"]).union(df["loser_name"]))
+    matrix = pd.DataFrame(0, index=teams, columns=teams, dtype=int)
 
-    df_res = df_res.drop_duplicates(
-        subset=["transaction_id", "season", "pick_league_id", "pick_roster_id"]
-    )
+    for _, row in df.iterrows():
+        w = row["winner_name"]
+        l = row["loser_name"]
+        matrix.loc[w, l] += 1
 
-    past = df_res[df_res["player_selected"].notna()].reset_index(drop=True)
-    future = df_res[df_res["player_selected"].isna()].reset_index(drop=True)
-    return past, future
+    return matrix
 
 
-def build_first_round_trade_view():
-    st.header("1st-Round Pick Trade Explorer")
-
-    all_tx = []
-    all_dp = []
-    all_rosters = []
-    all_users = []
-
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        tx_by_week = get_all_transactions_for_league(league_id)
-        for w, txs in tx_by_week.items():
-            for t in txs:
-                t["season"] = season
-                t["league_id"] = league_id
-                all_tx.append(t)
-
-        picks = get_all_draft_picks_for_league(league_id)
-        for p in picks:
-            p["season"] = season
-            all_dp.append(p)
-
-        rosters = get_rosters(league_id)
-        users = get_users(league_id)
-        for r in rosters:
-            r["season"] = season
-            r["league_id"] = league_id
-            all_rosters.append(r)
-        for u in users:
-            u["season"] = season
-            u["league_id"] = league_id
-            all_users.append(u)
-
-    past, future = compute_first_round_trade_results(all_tx, all_dp, all_rosters, all_users)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Past 1st-Round Picks (Already Drafted)")
-        if past.empty:
-            st.info("No past 1st-round pick trades have been mapped to drafted players yet.")
-        else:
-            display_cols = [
-                "season",
-                "original_owner",
-                "current_owner",
-                "player_selected",
-                "pick_no",
-                "transaction_id",
-            ]
-            st.dataframe(past[display_cols].sort_values(["season", "pick_no"]))
-
-    with col2:
-        st.subheader("Future 1st-Round Picks (Not Yet Drafted)")
-        if future.empty:
-            st.info("No future 1st-round pick trades found.")
-        else:
-            display_cols = [
-                "season",
-                "original_owner",
-                "current_owner",
-                "transaction_id",
-                "trade_draft_picks",
-            ]
-            st.dataframe(future[display_cols].sort_values(["season", "transaction_id"]))
-
-
-# ---------- PLAYOFF HISTORY ----------
-
-def classify_playoff_round(week, playoff_start_week):
-    if week < playoff_start_week:
-        return None
-    # Simple mapping: first playoff week = quarter/semis depending on league size
-    offset = week - playoff_start_week
-    if offset == 0:
-        return "Quarterfinal / Semifinal"
-    elif offset == 1:
-        return "Semifinal / Final"
-    else:
-        return "Championship / Consolation"
-
-
-def build_playoff_history_view():
-    st.header("Playoff History")
-
-    rows = []
-
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        league = get_league(league_id)
-        users, rosters, user_map, roster_owner, owner_to_roster, roster_name_map = build_user_and_roster_maps(league_id)
-
-        playoff_start = league.get("settings", {}).get("playoff_week_start", 15)
-        total_weeks = league.get("settings", {}).get("playoff_week_start", 15) + 3
-
-        for week in range(1, total_weeks + 1):
-            matchups = get_matchups(league_id, week)
-            if not matchups:
-                continue
-
-            # Try to detect playoff via matchup_type; fallback to week >= playoff_start
-            is_playoff_week = any(m.get("matchup_type") == "playoff" for m in matchups)
-            if not is_playoff_week and week < playoff_start:
-                continue
-
-            round_label = classify_playoff_round(week, playoff_start)
-
-            # Group by matchup_id
-            df_m = pd.DataFrame(matchups)
-            if "matchup_id" not in df_m.columns:
-                continue
-
-            for mid, g in df_m.groupby("matchup_id"):
-                if len(g) < 2:
-                    continue
-                g = g.sort_values("roster_id")
-                team_a = g.iloc[0]
-                team_b = g.iloc[1]
-
-                for team, opp in [(team_a, team_b), (team_b, team_a)]:
-                    rid = team["roster_id"]
-                    opp_rid = opp["roster_id"]
-                    pts = team.get("points", 0)
-                    opp_pts = opp.get("points", 0)
-
-                    owner_id = roster_owner.get(rid)
-                    opp_owner_id = roster_owner.get(opp_rid)
-
-                    rows.append({
-                        "season": season,
-                        "league_id": league_id,
-                        "week": week,
-                        "round": round_label,
-                        "roster_id": rid,
-                        "team_name": roster_name_map.get(rid, f"Roster {rid}"),
-                        "owner_id": owner_id,
-                        "opp_roster_id": opp_rid,
-                        "opp_team_name": roster_name_map.get(opp_rid, f"Roster {opp_rid}"),
-                        "opp_owner_id": opp_owner_id,
-                        "points": pts,
-                        "opp_points": opp_pts,
-                        "win": pts > opp_pts,
-                    })
-
-    if not rows:
-        st.info("No playoff data found across configured seasons.")
-        return
-
-    df = pd.DataFrame(rows)
-
-    # Aggregate playoff performance
-    agg = df.groupby(["team_name", "owner_id"]).agg(
-        playoff_games=("win", "count"),
-        playoff_wins=("win", "sum"),
-        playoff_losses=("win", lambda x: (~x).sum()),
-    ).reset_index()
-
-    agg["playoff_win_pct"] = np.where(
-        agg["playoff_games"] > 0,
-        agg["playoff_wins"] / agg["playoff_games"],
-        np.nan,
-    )
-
-    # Titles: championship wins = last playoff round, win == True
-    # Approx: highest week per season where team played & won
-    titles_rows = []
-    for (season, team_name), g in df.groupby(["season", "team_name"]):
-        max_week = g["week"].max()
-        g_last = g[g["week"] == max_week]
-        # If they won in last week they played, treat as title
-        if any(g_last["win"]):
-            titles_rows.append({"season": season, "team_name": team_name})
-
-    df_titles = pd.DataFrame(titles_rows)
-    title_counts = df_titles.groupby("team_name").size().reset_index(name="titles")
-
-    agg = agg.merge(title_counts, on="team_name", how="left")
-    agg["titles"] = agg["titles"].fillna(0).astype(int)
-
-    st.subheader("Playoff Summary by Team")
-    display_cols = [
-        "team_name",
-        "playoff_games",
-        "playoff_wins",
-        "playoff_losses",
-        "playoff_win_pct",
-        "titles",
-    ]
-    st.dataframe(
-        agg[display_cols].sort_values(
-            ["titles", "playoff_win_pct", "playoff_games"], ascending=[False, False, False]
-        )
-    )
-
-    st.subheader("Raw Playoff Matchups")
-    st.dataframe(
-        df.sort_values(["season", "week", "team_name"])[
-            ["season", "week", "round", "team_name", "points", "opp_team_name", "opp_points", "win"]
-        ]
-    )
-
-
-# ---------- MANAGER TENDENCIES ----------
-
-def build_manager_tendencies_view():
-    st.header("Manager Tendencies & Behavior")
-
-    rows = []
-
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        league = get_league(league_id)
-        users, rosters, user_map, roster_owner, owner_to_roster, roster_name_map = build_user_and_roster_maps(league_id)
-
-        playoff_start = league.get("settings", {}).get("playoff_week_start", 15)
-        total_weeks = playoff_start + 3
-
-        for week in range(1, total_weeks + 1):
-            matchups = get_matchups(league_id, week)
-            if not matchups:
-                continue
-
-            df_m = pd.DataFrame(matchups)
-            if "matchup_id" not in df_m.columns:
-                continue
-
-            for mid, g in df_m.groupby("matchup_id"):
-                if len(g) < 2:
-                    continue
-                g = g.sort_values("roster_id")
-                team_a = g.iloc[0]
-                team_b = g.iloc[1]
-
-                for team, opp in [(team_a, team_b), (team_b, team_a)]:
-                    rid = team["roster_id"]
-                    opp_rid = opp["roster_id"]
-                    pts = team.get("points", 0)
-                    opp_pts = opp.get("points", 0)
-                    proj = team.get("projected_points", 0)
-                    opp_proj = opp.get("projected_points", 0)
-
-                    owner_id = roster_owner.get(rid)
-                    opp_owner_id = roster_owner.get(opp_rid)
-
-                    margin = pts - opp_pts
-                    proj_margin = proj - opp_proj
-
-                    win = pts > opp_pts
-                    upset_win = win and proj < opp_proj
-                    upset_loss = (not win) and proj > opp_proj
-
-                    blowout_win = win and margin >= 30
-                    close_win = win and 0 < margin < 10
-                    blowout_loss = (not win) and margin <= -30
-                    heartbreaker_loss = (not win) and -10 < margin < 0
-
-                    rows.append({
-                        "season": season,
-                        "league_id": league_id,
-                        "week": week,
-                        "roster_id": rid,
-                        "team_name": roster_name_map.get(rid, f"Roster {rid}"),
-                        "owner_id": owner_id,
-                        "points": pts,
-                        "opp_points": opp_pts,
-                        "projected_points": proj,
-                        "opp_projected_points": opp_proj,
-                        "margin": margin,
-                        "proj_margin": proj_margin,
-                        "win": win,
-                        "upset_win": upset_win,
-                        "upset_loss": upset_loss,
-                        "blowout_win": blowout_win,
-                        "close_win": close_win,
-                        "blowout_loss": blowout_loss,
-                        "heartbreaker_loss": heartbreaker_loss,
-                    })
-
-    if not rows:
-        st.info("No matchup data found across configured seasons.")
-        return
-
-    df = pd.DataFrame(rows)
-
-    agg = df.groupby(["team_name", "owner_id"]).agg(
-        games=("win", "count"),
-        wins=("win", "sum"),
-        losses=("win", lambda x: (~x).sum()),
-        avg_margin=("margin", "mean"),
-        avg_proj_margin=("proj_margin", "mean"),
-        blowout_wins=("blowout_win", "sum"),
-        close_wins=("close_win", "sum"),
-        blowout_losses=("blowout_loss", "sum"),
-        heartbreaker_losses=("heartbreaker_loss", "sum"),
-        upset_wins=("upset_win", "sum"),
-        upset_losses=("upset_loss", "sum"),
-    ).reset_index()
-
-    agg["win_pct"] = np.where(
-        agg["games"] > 0,
-        agg["wins"] / agg["games"],
-        np.nan,
-    )
-
-    st.subheader("Manager Profiles")
-    display_cols = [
-        "team_name",
-        "games",
-        "wins",
-        "losses",
-        "win_pct",
-        "avg_margin",
-        "avg_proj_margin",
-        "blowout_wins",
-        "close_wins",
-        "blowout_losses",
-        "heartbreaker_losses",
-        "upset_wins",
-        "upset_losses",
-    ]
-    st.dataframe(
-        agg[display_cols].sort_values(
-            ["win_pct", "games"], ascending=[False, False]
-        )
-    )
-
-    st.subheader("Raw Matchup Tendencies")
-    st.dataframe(
-        df.sort_values(["season", "week", "team_name"])[
-            [
-                "season",
-                "week",
-                "team_name",
-                "points",
-                "opp_points",
-                "projected_points",
-                "opp_projected_points",
-                "margin",
-                "proj_margin",
-                "win",
-                "upset_win",
-                "upset_loss",
-                "blowout_win",
-                "close_win",
-                "blowout_loss",
-                "heartbreaker_loss",
-            ]
-        ]
-    )
-
-
-# ---------- SIMPLE PLACEHOLDER SECTIONS (OVERVIEW / H2H / RIVALRIES / TRANSACTIONS) ----------
-
-def build_league_overview_view():
-    st.header("League Overview")
-
-    leagues = get_all_league_data()
-    rows = []
-    for season, data in leagues.items():
-        league = data["league"]
-        rosters = data["rosters"]
-        users = data["users"]
-        rows.append({
-            "season": season,
-            "league_name": league.get("name", ""),
-            "num_teams": len(rosters),
-            "num_users": len(users),
-        })
-
-    df = pd.DataFrame(rows)
-    st.subheader("Basic League Snapshot")
-    st.dataframe(df.sort_values("season", ascending=False))
-
-
-def build_head_to_head_view():
-    st.header("Head-to-Head (Simple Summary)")
-
-    rows = []
-
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        users, rosters, user_map, roster_owner, owner_to_roster, roster_name_map = build_user_and_roster_maps(league_id)
-        matchups_by_week = get_all_matchups_for_league(league_id)
-
-        for week, matchups in matchups_by_week.items():
-            if not matchups:
-                continue
-            df_m = pd.DataFrame(matchups)
-            if "matchup_id" not in df_m.columns:
-                continue
-
-            for mid, g in df_m.groupby("matchup_id"):
-                if len(g) < 2:
-                    continue
-                g = g.sort_values("roster_id")
-                team_a = g.iloc[0]
-                team_b = g.iloc[1]
-
-                for team, opp in [(team_a, team_b), (team_b, team_a)]:
-                    rid = team["roster_id"]
-                    opp_rid = opp["roster_id"]
-                    pts = team.get("points", 0)
-                    opp_pts = opp.get("points", 0)
-                    owner_id = roster_owner.get(rid)
-                    opp_owner_id = roster_owner.get(opp_rid)
-
-                    rows.append({
-                        "season": season,
-                        "week": week,
-                        "team_name": roster_name_map.get(rid, f"Roster {rid}"),
-                        "opp_team_name": roster_name_map.get(opp_rid, f"Roster {opp_rid}"),
-                        "owner_id": owner_id,
-                        "opp_owner_id": opp_owner_id,
-                        "points": pts,
-                        "opp_points": opp_pts,
-                        "win": pts > opp_pts,
-                    })
-
-    if not rows:
+def render_head_to_head(league_ids: list):
+    st.header("Head-to-Head Matrix (All-Time)")
+    matrix = compute_head_to_head(league_ids)
+    if matrix.empty:
         st.info("No head-to-head data found.")
         return
-
-    df = pd.DataFrame(rows)
-
-    agg = df.groupby(["team_name"]).agg(
-        games=("win", "count"),
-        wins=("win", "sum"),
-        losses=("win", lambda x: (~x).sum()),
-        points_for=("points", "sum"),
-        points_against=("opp_points", "sum"),
-    ).reset_index()
-
-    agg["win_pct"] = np.where(
-        agg["games"] > 0,
-        agg["wins"] / agg["games"],
-        np.nan,
-    )
-
-    st.subheader("Head-to-Head Summary")
-    st.dataframe(
-        agg.sort_values(["win_pct", "games"], ascending=[False, False])
-    )
+    st.dataframe(matrix.style.format("{:d}"))
 
 
-def build_rivalries_view():
-    st.header("Rivalries (Simple View)")
+# -----------------------------
+# Top Rivalries
+# -----------------------------
+def compute_rivalries(league_ids: list) -> pd.DataFrame:
+    records = []
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        roster_name_map = build_roster_user_map(league_id)
 
-    rows = []
-
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        users, rosters, user_map, roster_owner, owner_to_roster, roster_name_map = build_user_and_roster_maps(league_id)
-        matchups_by_week = get_all_matchups_for_league(league_id)
-
-        for week, matchups in matchups_by_week.items():
+        for week in range(1, 19):
+            matchups = get_league_matchups(league_id, week)
             if not matchups:
                 continue
-            df_m = pd.DataFrame(matchups)
-            if "matchup_id" not in df_m.columns:
+            df = pd.DataFrame(matchups)
+            if "matchup_id" not in df.columns:
                 continue
-
-            for mid, g in df_m.groupby("matchup_id"):
-                if len(g) < 2:
+            for mid, group in df.groupby("matchup_id"):
+                if len(group) != 2:
                     continue
-                g = g.sort_values("roster_id")
-                team_a = g.iloc[0]
-                team_b = g.iloc[1]
+                a, b = group.iloc[0], group.iloc[1]
+                ra, rb = a["roster_id"], b["roster_id"]
+                sa, sb = a.get("points", 0), b.get("points", 0)
+                name_a = roster_name_map.get(ra, f"Roster {ra}")
+                name_b = roster_name_map.get(rb, f"Roster {rb}")
+                pair = tuple(sorted([name_a, name_b]))
+                margin = sa - sb
+                records.append(
+                    {
+                        "season": season,
+                        "team_a": pair[0],
+                        "team_b": pair[1],
+                        "points_a": sa if name_a == pair[0] else sb,
+                        "points_b": sb if name_b == pair[1] else sa,
+                    }
+                )
 
-                rid_a = team_a["roster_id"]
-                rid_b = team_b["roster_id"]
-                pts_a = team_a.get("points", 0)
-                pts_b = team_b.get("points", 0)
+    if not records:
+        return pd.DataFrame()
 
-                name_a = roster_name_map.get(rid_a, f"Roster {rid_a}")
-                name_b = roster_name_map.get(rid_b, f"Roster {rid_b}")
+    df = pd.DataFrame(records)
+    df["games"] = 1
+    df["diff"] = df["points_a"] - df["points_b"]
 
-                rows.append({
-                    "season": season,
-                    "team_a": name_a,
-                    "team_b": name_b,
-                    "points_a": pts_a,
-                    "points_b": pts_b,
-                    "winner": name_a if pts_a > pts_b else (name_b if pts_b > pts_a else "Tie"),
-                })
+    agg = (
+        df.groupby(["team_a", "team_b"])
+        .agg(
+            games=("games", "sum"),
+            total_diff=("diff", "sum"),
+            avg_margin=("diff", "mean"),
+        )
+        .reset_index()
+    )
 
-    if not rows:
+    # rivalry score: games * 1/(1+abs(total_diff))
+    agg["rivalry_score"] = agg["games"] * (1 / (1 + agg["total_diff"].abs()))
+    agg = agg.sort_values("rivalry_score", ascending=False)
+    return agg
+
+
+def render_top_rivalries(league_ids: list):
+    st.header("Top Rivalries")
+    df = compute_rivalries(league_ids)
+    if df.empty:
         st.info("No rivalry data found.")
         return
 
-    df = pd.DataFrame(rows)
-
-    # Normalize pair key
-    df["pair"] = df.apply(
-        lambda r: " vs ".join(sorted([r["team_a"], r["team_b"]])),
-        axis=1,
+    top_n = st.slider("Number of rivalries to show", 5, 50, 10)
+    st.subheader("Top Rivalries (Ranked)")
+    st.dataframe(
+        df.head(top_n)[
+            ["team_a", "team_b", "games", "total_diff", "avg_margin", "rivalry_score"]
+        ]
     )
 
-    agg = df.groupby("pair").agg(
-        games=("winner", "count"),
-        wins_a=("winner", lambda x: sum(x == x.index[0])),
-    ).reset_index()
 
-    st.subheader("Rivalry Pairs (by games played)")
+# -----------------------------
+# Playoff History
+# -----------------------------
+def compute_playoff_history(league_ids: list) -> pd.DataFrame:
+    records = []
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        settings = league.get("settings", {})
+        playoff_week_start = settings.get("playoff_week_start")
+        if not playoff_week_start:
+            continue
+
+        roster_name_map = build_roster_user_map(league_id)
+
+        # assume playoffs from playoff_week_start to playoff_week_start+3
+        for week in range(playoff_week_start, playoff_week_start + 4):
+            matchups = get_league_matchups(league_id, week)
+            if not matchups:
+                continue
+            df = pd.DataFrame(matchups)
+            if "matchup_id" not in df.columns:
+                continue
+            for mid, group in df.groupby("matchup_id"):
+                if len(group) != 2:
+                    continue
+                a, b = group.iloc[0], group.iloc[1]
+                ra, rb = a["roster_id"], b["roster_id"]
+                sa, sb = a.get("points", 0), b.get("points", 0)
+                if sa == sb:
+                    continue
+                if sa > sb:
+                    winner, loser = ra, rb
+                    wp, lp = sa, sb
+                else:
+                    winner, loser = rb, ra
+                    wp, lp = sb, sa
+                records.append(
+                    {
+                        "season": season,
+                        "week": week,
+                        "winner_roster_id": winner,
+                        "loser_roster_id": loser,
+                        "winner_name": roster_name_map.get(
+                            winner, f"Roster {winner}"
+                        ),
+                        "loser_name": roster_name_map.get(loser, f"Roster {loser}"),
+                        "winner_points": wp,
+                        "loser_points": lp,
+                    }
+                )
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    # Titles: last playoff week winner in each season
+    titles = (
+        df.sort_values(["season", "week"])
+        .groupby("season")
+        .tail(1)[["season", "winner_name"]]
+        .rename(columns={"winner_name": "champion"})
+    )
+
+    # Playoff records
+    wins = df.groupby("winner_name").size().rename("playoff_wins")
+    losses = df.groupby("loser_name").size().rename("playoff_losses")
+    rec = pd.concat([wins, losses], axis=1).fillna(0)
+    rec["playoff_games"] = rec["playoff_wins"] + rec["playoff_losses"]
+    rec["playoff_win_pct"] = np.where(
+        rec["playoff_games"] > 0,
+        rec["playoff_wins"] / rec["playoff_games"],
+        np.nan,
+    )
+    rec = rec.reset_index().rename(columns={"index": "team"})
+
+    return df, titles, rec
+
+
+def render_playoff_history(league_ids: list):
+    st.header("Playoff History")
+    df, titles, rec = compute_playoff_history(league_ids)
+    if df.empty:
+        st.info("No playoff data found.")
+        return
+
+    st.subheader("Champions by Season")
+    st.dataframe(titles.sort_values("season"))
+
+    st.subheader("Playoff Records")
     st.dataframe(
-        df[["season", "team_a", "team_b", "points_a", "points_b", "winner"]].sort_values(
-            ["season", "team_a", "team_b"]
+        rec.sort_values("playoff_win_pct", ascending=False),
+        use_container_width=True,
+    )
+
+    st.subheader("Playoff Matchups (All-Time)")
+    st.dataframe(
+        df[
+            [
+                "season",
+                "week",
+                "winner_name",
+                "winner_points",
+                "loser_name",
+                "loser_points",
+            ]
+        ].sort_values(["season", "week"]),
+        use_container_width=True,
+    )
+
+
+# -----------------------------
+# Team Transaction Profiles + Archetypes
+# -----------------------------
+def compute_transaction_profiles(league_ids: list) -> pd.DataFrame:
+    records = []
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        roster_name_map = build_roster_user_map(league_id)
+
+        # naive week range; fine for dynasty
+        for week in range(1, 19):
+            txs = get_league_transactions(league_id, week)
+            if not txs:
+                continue
+            for tx in txs:
+                ttype = tx.get("type")
+                status = tx.get("status")
+                if status != "complete":
+                    continue
+                roster_ids = tx.get("roster_ids") or []
+                for rid in roster_ids:
+                    records.append(
+                        {
+                            "season": season,
+                            "roster_id": rid,
+                            "team": roster_name_map.get(rid, f"Roster {rid}"),
+                            "type": ttype,
+                            "adds": len(tx.get("adds") or {}),
+                            "drops": len(tx.get("drops") or {}),
+                            "waiver_bid": (tx.get("settings") or {}).get(
+                                "waiver_bid", 0
+                            ),
+                        }
+                    )
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    agg = (
+        df.groupby(["team", "type"])
+        .agg(
+            adds=("adds", "sum"),
+            drops=("drops", "sum"),
+            faab_spent=("waiver_bid", "sum"),
+            tx_count=("type", "size"),
+        )
+        .reset_index()
+    )
+
+    # pivot to wide
+    wide = agg.pivot(index="team", columns="type", values="tx_count").fillna(0)
+    wide.columns = [f"{c}_count" for c in wide.columns]
+
+    adds_drops = (
+        df.groupby("team")[["adds", "drops", "waiver_bid"]].sum().rename(
+            columns={"waiver_bid": "faab_spent"}
         )
     )
 
+    out = wide.join(adds_drops, how="outer").fillna(0)
 
-def build_transactions_view():
-    st.header("Transactions & Archetypes (Simple View)")
+    # simple aggressiveness metrics
+    out["trade_aggressiveness"] = out.get("trade_count", 0)
+    out["waiver_aggressiveness"] = out.get("waiver_count", 0) + out.get(
+        "free_agent_count", 0
+    )
+    out["roster_churn"] = out["adds"] + out["drops"]
 
-    rows = []
+    # archetypes
+    def classify(row):
+        t = row.get("trade_aggressiveness", 0)
+        w = row.get("waiver_aggressiveness", 0)
+        churn = row.get("roster_churn", 0)
 
-    for season, league_id in LEAGUE_IDS_BY_SEASON.items():
-        tx_by_week = get_all_transactions_for_league(league_id)
-        for week, txs in tx_by_week.items():
-            for t in txs:
-                rows.append({
-                    "season": season,
-                    "league_id": league_id,
-                    "week": week,
-                    "type": t.get("type"),
-                    "status": t.get("status"),
-                    "transaction_id": t.get("transaction_id"),
-                })
+        # thresholds are relative; we can use quantiles later if needed
+        if t > 10 and churn > 40:
+            return "The Chaos Agent"
+        if t > 10:
+            return "The Trader"
+        if churn < 10:
+            return "The Hoarder"
+        if w > 30:
+            return "The Streamer"
+        if t < 5 and churn < 25:
+            return "The Sniper"
+        return "Balanced"
 
-    if not rows:
+    out["archetype"] = out.apply(classify, axis=1)
+    out = out.reset_index()
+    return out
+
+
+def render_transaction_profiles(league_ids: list):
+    st.header("Team Transaction Profiles & Archetypes")
+    df = compute_transaction_profiles(league_ids)
+    if df.empty:
         st.info("No transaction data found.")
         return
 
-    df = pd.DataFrame(rows)
-
-    st.subheader("Transaction Types by Season")
     st.dataframe(
-        df.groupby(["season", "type"]).size().reset_index(name="count").sort_values(
-            ["season", "count"], ascending=[False, False]
-        )
+        df[
+            [
+                "team",
+                "trade_count",
+                "waiver_count",
+                "free_agent_count",
+                "adds",
+                "drops",
+                "faab_spent",
+                "roster_churn",
+                "trade_aggressiveness",
+                "waiver_aggressiveness",
+                "archetype",
+            ]
+        ].sort_values("trade_aggressiveness", ascending=False),
+        use_container_width=True,
     )
 
-    st.subheader("Raw Transactions")
-    st.dataframe(df.sort_values(["season", "week", "transaction_id"]))
+
+# -----------------------------
+# Manager Tendencies (cleaned)
+# -----------------------------
+def compute_manager_tendencies(league_ids: list) -> pd.DataFrame:
+    # Simple version: combine H2H + transactions to get a flavor profile
+    # You can expand this later with more nuance.
+    h2h_matrix = compute_head_to_head(league_ids)
+    if h2h_matrix.empty:
+        return pd.DataFrame()
+
+    teams = h2h_matrix.index.tolist()
+    total_wins = h2h_matrix.sum(axis=1)
+    total_losses = h2h_matrix.sum(axis=0)
+    tendencies = pd.DataFrame(
+        {
+            "team": teams,
+            "wins": total_wins.values,
+            "losses": total_losses.values,
+        }
+    )
+    tendencies["games"] = tendencies["wins"] + tendencies["losses"]
+    tendencies["win_pct"] = np.where(
+        tendencies["games"] > 0,
+        tendencies["wins"] / tendencies["games"],
+        np.nan,
+    )
+
+    # join with transaction profiles for a richer view
+    tx = compute_transaction_profiles(league_ids)
+    if not tx.empty:
+        tendencies = tendencies.merge(tx[["team", "archetype"]], on="team", how="left")
+
+    return tendencies
 
 
-# ---------- MAIN APP ----------
+def render_manager_tendencies(league_ids: list):
+    st.header("Manager Tendencies")
+    df = compute_manager_tendencies(league_ids)
+    if df.empty:
+        st.info("No tendencies data found.")
+        return
 
+    st.dataframe(
+        df.sort_values("win_pct", ascending=False),
+        use_container_width=True,
+    )
+
+
+# -----------------------------
+# 1st-Round Pick Trade Explorer
+# -----------------------------
+def compute_first_round_trades(league_ids: list) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      traded_picks_df: one row per traded 1st-round pick
+      trade_details_df: one row per trade with C-1 style breakdown
+    """
+    # Build season -> league_id map
+    season_to_league = {}
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season_to_league[league.get("season")] = league_id
+
+    # Build season -> roster_id -> team name map
+    season_roster_name = {}
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        season_roster_name[season] = build_roster_user_map(league_id)
+
+    # Build season -> draft picks (round, roster_id, pick_no, player name)
+    season_round_roster_to_pick = {}
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        drafts = get_league_drafts(league_id)
+        if not drafts:
+            continue
+        # assume first draft is the main one
+        for d in drafts:
+            if d.get("season") != season:
+                continue
+            draft_id = d["draft_id"]
+            picks = get_draft_picks(draft_id)
+            for p in picks:
+                rnd = p.get("round")
+                rid = p.get("roster_id")
+                pick_no = p.get("pick_no")
+                meta = p.get("metadata") or {}
+                first = meta.get("first_name", "")
+                last = meta.get("last_name", "")
+                full_name = f"{first} {last}".strip()
+                key = (season, rnd, rid)
+                season_round_roster_to_pick[key] = {
+                    "pick_no": pick_no,
+                    "player_name": full_name,
+                }
+
+    traded_pick_rows = []
+    trade_detail_rows = []
+
+    for league_id in league_ids:
+        league = get_league(league_id)
+        season = league.get("season")
+        roster_name_map = season_roster_name.get(season, {})
+
+        # collect all trades in this league
+        trades = []
+        for week in range(1, 19):
+            txs = get_league_transactions(league_id, week)
+            if not txs:
+                continue
+            for tx in txs:
+                if tx.get("status") != "complete":
+                    continue
+                if tx.get("type") != "trade":
+                    continue
+                trades.append(tx)
+
+        for tx in trades:
+            tx_id = tx.get("transaction_id")
+            draft_picks = tx.get("draft_picks") or []
+            roster_ids = tx.get("roster_ids") or []
+            consenter_ids = tx.get("consenter_ids") or roster_ids
+
+            # map roster_id -> team name
+            team_names = {rid: roster_name_map.get(rid, f"Roster {rid}") for rid in roster_ids}
+
+            # 1) Traded 1st-round picks table
+            for dp in draft_picks:
+                if dp.get("round") != 1:
+                    continue
+                pick_season = dp.get("season")
+                slot_roster_id = dp.get("roster_id")
+                original_owner_id = dp.get("previous_owner_id")
+                new_owner_id = dp.get("owner_id")
+
+                # map owners to names via roster_id if possible
+                original_owner_name = roster_name_map.get(
+                    original_owner_id, f"Roster {original_owner_id}"
+                )
+                new_owner_name = roster_name_map.get(
+                    new_owner_id, f"Roster {new_owner_id}"
+                )
+                original_slot_name = roster_name_map.get(
+                    slot_roster_id, f"Roster {slot_roster_id}"
+                )
+
+                key = (pick_season, 1, slot_roster_id)
+                pick_info = season_round_roster_to_pick.get(key, {})
+                pick_no = pick_info.get("pick_no")
+                player_name = pick_info.get("player_name", "Unknown Player")
+
+                if pick_no is not None:
+                    player_display = f"{player_name} (1.{pick_no:02d})"
+                else:
+                    player_display = f"{player_name} (1.??)"
+
+                traded_pick_rows.append(
+                    {
+                        "season": pick_season,
+                        "original_owner": original_owner_name,
+                        "new_owner": new_owner_name,
+                        "original_slot": original_slot_name,
+                        "player_selected": player_display,
+                    }
+                )
+
+            # 2) Trade details table (C-1 style)
+            # Build what each team sent in terms of picks (we focus on picks; players can be added later)
+            sent_by_team = {rid: [] for rid in roster_ids}
+
+            for dp in draft_picks:
+                rnd = dp.get("round")
+                pick_season = dp.get("season")
+                slot_roster_id = dp.get("roster_id")
+                prev_owner = dp.get("previous_owner_id")
+                owner = dp.get("owner_id")
+
+                slot_name = roster_name_map.get(slot_roster_id, f"Roster {slot_roster_id}")
+                desc = f"{pick_season} {rnd}st (slot {slot_name})" if rnd == 1 else f"{pick_season} {rnd}th (slot {slot_name})"
+
+                # previous_owner "sent" the pick, new owner "received" it
+                if prev_owner in sent_by_team:
+                    sent_by_team[prev_owner].append(desc)
+
+            # Build C-1 text
+            if len(consenter_ids) == 2:
+                a, b = consenter_ids
+                name_a = roster_name_map.get(a, f"Roster {a}")
+                name_b = roster_name_map.get(b, f"Roster {b}")
+                teams_involved = f"{name_a} ↔ {name_b}"
+
+                sent_a = ", ".join(sent_by_team.get(a, [])) or "None"
+                sent_b = ", ".join(sent_by_team.get(b, [])) or "None"
+
+                detailed_breakdown = (
+                    f"Team {name_a} sent: {sent_a}\n"
+                    f"Team {name_b} sent: {sent_b}"
+                )
+            else:
+                # multi-team trade; we still show something
+                names = [roster_name_map.get(r, f"Roster {r}") for r in consenter_ids]
+                teams_involved = " ↔ ".join(names)
+                parts = []
+                for rid in consenter_ids:
+                    nm = roster_name_map.get(rid, f"Roster {rid}")
+                    sent = ", ".join(sent_by_team.get(rid, [])) or "None"
+                    parts.append(f"Team {nm} sent: {sent}")
+                detailed_breakdown = "\n".join(parts)
+
+            # 1st-round outcomes for this trade
+            outcomes = []
+            for dp in draft_picks:
+                if dp.get("round") != 1:
+                    continue
+                pick_season = dp.get("season")
+                slot_roster_id = dp.get("roster_id")
+                slot_name = roster_name_map.get(slot_roster_id, f"Roster {slot_roster_id}")
+                key = (pick_season, 1, slot_roster_id)
+                pick_info = season_round_roster_to_pick.get(key, {})
+                pick_no = pick_info.get("pick_no")
+                player_name = pick_info.get("player_name", "Unknown Player")
+                if pick_no is not None:
+                    player_display = f"{player_name} (1.{pick_no:02d})"
+                else:
+                    player_display = f"{player_name} (1.??)"
+                outcomes.append(f"{pick_season} 1st (slot {slot_name}) → {player_display}")
+
+            outcomes_text = "\n".join(outcomes) if outcomes else "No 1st-round picks in this trade"
+
+            trade_detail_rows.append(
+                {
+                    "season": season,
+                    "teams_involved": teams_involved,
+                    "detailed_breakdown": detailed_breakdown,
+                    "first_round_outcomes": outcomes_text,
+                }
+            )
+
+    traded_picks_df = pd.DataFrame(traded_pick_rows).sort_values(
+        ["season", "original_owner"]
+    )
+    trade_details_df = pd.DataFrame(trade_detail_rows).sort_values(
+        ["season", "teams_involved"]
+    )
+
+    return traded_picks_df, trade_details_df
+
+
+def render_first_round_pick_explorer(league_ids: list):
+    st.header("1st-Round Pick Trade Explorer")
+
+    traded_picks_df, trade_details_df = compute_first_round_trades(league_ids)
+
+    if traded_picks_df.empty:
+        st.info("No traded 1st-round picks found.")
+        return
+
+    st.subheader("Traded 1st-Round Picks (One Row per Pick)")
+    st.dataframe(
+        traded_picks_df[
+            ["season", "original_owner", "new_owner", "original_slot", "player_selected"]
+        ],
+        use_container_width=True,
+    )
+
+    st.subheader("Trade Details (One Row per Trade)")
+    st.dataframe(
+        trade_details_df[
+            ["season", "teams_involved", "detailed_breakdown", "first_round_outcomes"]
+        ],
+        use_container_width=True,
+    )
+
+
+# -----------------------------
+# Main app
+# -----------------------------
 def main():
-    st.title("Dynasty Dashboard")
+    st.set_page_config(page_title="Dynasty League Dashboard", layout="wide")
+    st.title("Dynasty League Dashboard")
 
-    st.sidebar.title("Navigation")
-    section = st.sidebar.selectbox(
-        "Go to section",
+    base_league_id = st.text_input(
+        "Sleeper League ID (current season)",
+        value="1180359904212156416",  # you can change this default
+    )
+
+    if not base_league_id:
+        st.stop()
+
+    try:
+        league_ids = get_all_league_ids(base_league_id)
+    except Exception as e:
+        st.error(f"Error loading league hierarchy: {e}")
+        st.stop()
+
+    tab = st.sidebar.selectbox(
+        "Select View",
         [
-            "League Overview",
             "Head-to-Head",
-            "Rivalries",
-            "Transactions & Archetypes",
-            "1st-Round Pick Trade Explorer",
+            "Top Rivalries",
             "Playoff History",
+            "Team Transaction Profiles",
             "Manager Tendencies",
+            "1st-Round Pick Trade Explorer",
         ],
     )
 
-    if section == "League Overview":
-        build_league_overview_view()
-    elif section == "Head-to-Head":
-        build_head_to_head_view()
-    elif section == "Rivalries":
-        build_rivalries_view()
-    elif section == "Transactions & Archetypes":
-        build_transactions_view()
-    elif section == "1st-Round Pick Trade Explorer":
-        build_first_round_trade_view()
-    elif section == "Playoff History":
-        build_playoff_history_view()
-    elif section == "Manager Tendencies":
-        build_manager_tendencies_view()
+    if tab == "Head-to-Head":
+        render_head_to_head(league_ids)
+    elif tab == "Top Rivalries":
+        render_top_rivalries(league_ids)
+    elif tab == "Playoff History":
+        render_playoff_history(league_ids)
+    elif tab == "Team Transaction Profiles":
+        render_transaction_profiles(league_ids)
+    elif tab == "Manager Tendencies":
+        render_manager_tendencies(league_ids)
+    elif tab == "1st-Round Pick Trade Explorer":
+        render_first_round_pick_explorer(league_ids)
 
 
 if __name__ == "__main__":
