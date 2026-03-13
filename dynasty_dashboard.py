@@ -303,7 +303,7 @@ def render_top_rivalries(league_ids: list):
 
 
 # -----------------------------
-# Playoff History (winners bracket via seeds)
+# Playoff History (6-team, correct weeks, winners bracket only)
 # -----------------------------
 def compute_playoff_history(league_ids: list):
     records = []
@@ -313,34 +313,36 @@ def compute_playoff_history(league_ids: list):
         if season_raw is None:
             continue
         season = int(season_raw)
-        settings = league.get("settings", {}) or {}
 
-        playoff_week_start = settings.get("playoff_week_start")
-        playoff_teams = settings.get("playoff_teams")
-
-        if playoff_week_start:
-            playoff_week_start = int(playoff_week_start)
+        # Explicit playoff weeks based on your league:
+        # 2020: weeks 14–16; 2021+: weeks 15–17
+        if season == 2020:
+            playoff_weeks = [14, 15, 16]
         else:
-            if season == 2020:
-                playoff_week_start = 14
-            else:
-                playoff_week_start = 15
-
-        # Use all weeks from playoff start through week 18; seeds will filter winners bracket
-        playoff_weeks = list(range(playoff_week_start, 19))
+            playoff_weeks = [15, 16, 17]
 
         rosters = get_league_rosters(league_id)
         playoff_rosters = set()
         for r in rosters:
-            seed = (r.get("settings") or {}).get("seed")
+            r_settings = r.get("settings") or {}
+            seed = (
+                r_settings.get("seed")
+                or r_settings.get("playoff_seed")
+                or r_settings.get("p_standings")
+                or r_settings.get("rank")
+            )
             if seed is None:
                 continue
             try:
                 seed_int = int(seed)
             except (TypeError, ValueError):
                 continue
+            # 6-team playoff, seeds 1–6
             if 1 <= seed_int <= 6:
                 playoff_rosters.add(r["roster_id"])
+
+        if not playoff_rosters:
+            continue
 
         roster_name_map = build_roster_user_map(league_id)
 
@@ -358,6 +360,7 @@ def compute_playoff_history(league_ids: list):
                 a, b = group.iloc[0], group.iloc[1]
                 ra, rb = a["roster_id"], b["roster_id"]
 
+                # Winners bracket only: both must be playoff teams
                 if ra not in playoff_rosters or rb not in playoff_rosters:
                     continue
 
@@ -389,15 +392,54 @@ def compute_playoff_history(league_ids: list):
 
     df = pd.DataFrame(records)
 
+    # Champion logic: team with playoff wins and zero playoff losses
     champs = []
     for season, g in df.groupby("season"):
-        last_week = g["week"].max()
-        finals = g[g["week"] == last_week].copy()
-        if finals.empty:
+        # Compute per-team playoff record within this season
+        wins = g.groupby("winner_name").size().rename("wins")
+        losses = g.groupby("loser_name").size().rename("losses")
+        rec = pd.concat([wins, losses], axis=1).fillna(0)
+        rec["wins"] = rec["wins"].astype(int)
+        rec["losses"] = rec["losses"].astype(int)
+
+        # Candidates: at least one win, zero losses
+        candidates = rec[(rec["wins"] > 0) & (rec["losses"] == 0)]
+        if candidates.empty:
             continue
-        finals["total_points"] = finals["winner_points"] + finals["loser_points"]
-        row = finals.sort_values("total_points", ascending=False).iloc[0]
-        champs.append({"season": season, "champion": row["winner_name"]})
+
+        # If multiple, break ties by:
+        # 1) most wins
+        # 2) latest playoff week they won
+        # 3) highest total playoff points
+        candidates = candidates.sort_values("wins", ascending=False)
+        top_wins = candidates["wins"].max()
+        candidates = candidates[candidates["wins"] == top_wins]
+
+        if len(candidates) == 1:
+            champ_name = candidates.index[0]
+        else:
+            # Tie-breaker 2: latest win week
+            latest_win_week = {}
+            total_points = {}
+            for team in candidates.index:
+                team_games = g[(g["winner_name"] == team) | (g["loser_name"] == team)]
+                win_games = g[g["winner_name"] == team]
+                if not win_games.empty:
+                    latest_win_week[team] = win_games["week"].max()
+                else:
+                    latest_win_week[team] = -1
+                total_points[team] = (
+                    team_games["winner_points"].sum() + team_games["loser_points"].sum()
+                )
+            max_week = max(latest_win_week.values())
+            week_candidates = [t for t, w in latest_win_week.items() if w == max_week]
+            if len(week_candidates) == 1:
+                champ_name = week_candidates[0]
+            else:
+                # Tie-breaker 3: highest total points
+                champ_name = max(week_candidates, key=lambda t: total_points[t])
+
+        champs.append({"season": season, "champion": champ_name})
 
     titles = pd.DataFrame(champs)
 
@@ -723,7 +765,7 @@ def render_manager_tendencies(league_ids: list):
 
 
 # -----------------------------
-# 1st-Round Pick Trade Explorer (clean mapping + full sent assets)
+# 1st-Round Pick Trade Explorer (trade-level only + team filter)
 # -----------------------------
 def compute_first_round_trades(league_ids: list):
     season_roster_name = {}
@@ -952,161 +994,38 @@ def compute_first_round_trades(league_ids: list):
 def render_first_round_pick_explorer(league_ids: list):
     st.header("1st-Round Pick Trade Explorer")
 
-    traded_picks_df, trade_details_df = compute_first_round_trades(league_ids)
+    _, trade_details_df = compute_first_round_trades(league_ids)
 
-    if traded_picks_df.empty:
+    if trade_details_df.empty:
         st.info("No traded 1st-round picks found.")
         return
 
-    st.subheader("Traded 1st-Round Picks (One Row per Pick)")
-    st.dataframe(
-        traded_picks_df[
-            ["season", "pick", "original_slot", "original_owner", "new_owner", "player_selected"]
-        ],
-        use_container_width=True,
-    )
+    # Option B: dropdown shows ALL teams in league history, even if they never traded a 1st
+    all_team_names = set()
+    for league_id in league_ids:
+        roster_name_map = build_roster_user_map(league_id)
+        all_team_names.update(roster_name_map.values())
+
+    team_options = ["All Teams"] + sorted(all_team_names)
+    selected_team = st.selectbox("Filter by team", team_options)
+
+    if selected_team != "All Teams":
+        mask = (
+            trade_details_df["teams_involved"].str.contains(selected_team, na=False)
+            | trade_details_df["picks_exchanged"].str.contains(selected_team, na=False)
+            | trade_details_df["players_selected"].str.contains(selected_team, na=False)
+        )
+        filtered_df = trade_details_df[mask]
+    else:
+        filtered_df = trade_details_df
 
     st.subheader("Trade Details (One Row per Trade)")
     st.dataframe(
-        trade_details_df[
+        filtered_df[
             ["season", "teams_involved", "picks_exchanged", "players_selected"]
         ],
         use_container_width=True,
     )
-
-
-# -----------------------------
-# Trade Trees (player-only, last-name search)
-# -----------------------------
-def build_trade_events_for_league(league_id: str) -> pd.DataFrame:
-    league = get_league(league_id)
-    season_raw = league.get("season")
-    if season_raw is None:
-        return pd.DataFrame()
-    season = int(season_raw)
-    events = []
-    for week in range(1, 19):
-        txs = get_league_transactions(league_id, week)
-        if not txs:
-            continue
-        for tx in txs:
-            if tx.get("type") != "trade" or tx.get("status") != "complete":
-                continue
-            tid = tx.get("transaction_id")
-            adds = tx.get("adds") or {}
-            drops = tx.get("drops") or {}
-
-            for pid, rid in adds.items():
-                events.append(
-                    {
-                        "season": season,
-                        "week": week,
-                        "transaction_id": tid,
-                        "asset_type": "player",
-                        "asset_id": pid,
-                        "to_roster": rid,
-                        "from_roster": None,
-                        "direction": "in",
-                    }
-                )
-            for pid, rid in drops.items():
-                events.append(
-                    {
-                        "season": season,
-                        "week": week,
-                        "transaction_id": tid,
-                        "asset_type": "player",
-                        "asset_id": pid,
-                        "to_roster": None,
-                        "from_roster": rid,
-                        "direction": "out",
-                    }
-                )
-
-    return pd.DataFrame(events)
-
-
-def build_player_lineage(league_ids: list, player_id: str) -> pd.DataFrame:
-    rows = []
-    step = 0
-    for league_id in league_ids:
-        league = get_league(league_id)
-        season_raw = league.get("season")
-        if season_raw is None:
-            continue
-        season = int(season_raw)
-        events = build_trade_events_for_league(league_id)
-        if events.empty:
-            continue
-        mask = (events["asset_type"] == "player") & (events["asset_id"] == player_id)
-        dfp = events[mask]
-        if dfp.empty:
-            continue
-        roster_name_map = build_roster_user_map(league_id)
-        for _, row in dfp.iterrows():
-            step += 1
-            direction = row["direction"]
-            if direction == "in":
-                desc = f"Acquired in {season}, Week {row['week']}"
-                frm = ""
-                to = roster_name_map.get(row.get("to_roster"), "")
-            else:
-                desc = f"Sent away in {season}, Week {row['week']}"
-                frm = roster_name_map.get(row.get("from_roster"), "")
-                to = ""
-            rows.append(
-                {
-                    "Step": step,
-                    "Description": desc,
-                    "From": frm,
-                    "To": to,
-                    "Season": season,
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-def render_trade_trees(league_ids: list):
-    st.header("Trade Trees (Player Lineage)")
-
-    players_meta = get_players()
-
-    last_name_query = st.text_input("Player last name (case-insensitive)")
-
-    if not last_name_query:
-        st.info("Enter a last name to search for a player.")
-        return
-
-    matches = []
-    q = last_name_query.strip().lower()
-    for pid, info in players_meta.items():
-        ln = (info.get("last_name") or "").lower()
-        fn = info.get("first_name") or ""
-        if ln == q:
-            full = info.get("full_name") or f"{fn} {info.get('last_name') or ''}".strip()
-            matches.append((pid, full))
-
-    if not matches:
-        st.info("No players found with that last name.")
-        return
-
-    if len(matches) == 1:
-        selected_pid, selected_name = matches[0]
-    else:
-        options = [f"{name} (id: {pid})" for pid, name in matches]
-        choice = st.selectbox("Select player", options)
-        idx = options.index(choice)
-        selected_pid, selected_name = matches[idx]
-
-    st.markdown(f"**Selected player:** {selected_name}")
-
-    if st.button("Build Player Lineage"):
-        df = build_player_lineage(league_ids, selected_pid)
-        if df.empty:
-            st.info("No lineage events found for this player.")
-        else:
-            st.dataframe(df.sort_values(["Season", "Step"]), use_container_width=True)
 
 
 # -----------------------------
@@ -1139,7 +1058,6 @@ def main():
             "Team Transaction Profiles",
             "Manager Tendencies",
             "1st-Round Pick Trade Explorer",
-            "Trade Trees",
         ],
     )
 
@@ -1155,8 +1073,6 @@ def main():
         render_manager_tendencies(league_ids)
     elif tab == "1st-Round Pick Trade Explorer":
         render_first_round_pick_explorer(league_ids)
-    elif tab == "Trade Trees":
-        render_trade_trees(league_ids)
 
 
 if __name__ == "__main__":
